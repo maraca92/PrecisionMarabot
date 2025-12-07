@@ -1,7 +1,7 @@
 services:
   - type: web
-    name: ob-bot
+    name: ob-bot  # Your service name
     env: python
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
-    runtime: python3.12  # Stable, kompatybilne z pandas 2.1.0
+    pythonVersion: 3.12  # Stable fix
