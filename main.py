@@ -1,14 +1,6 @@
-# main.py - Grok Elite Signal Bot v24.01.8 - Institutional OB Focus: Zero Noise Edition (Order Flow Enhanced + Env Debug + Relaxed Roadmap + Low-Vol Unlock)
-# UPGRADE (v24.01.8): Vol>1.2x (from 1.5x), delta>0.5% (from 1%), min 1 trigger (from 2) for low-vol roadmaps; all triggers log.
-# Retained v24.01.7: Relaxed roadmap generation thresholds (conf>80 from 90, dist<6% from 5%, filter prob>=80 from 85, triggers>=2 from 3) for earlier signals with minimal accuracy trade-off.
-# Retained v24.01.6: Env debug logs in main(); query_grok_instant upgraded (str=2+, conf≥75%, lev3-7x); backtest symmetry fixed; order_flow cache eviction.
-# Retained v24.01.5: Order Flow (delta + footprint) via ccxt order_book; conf boost +2 on imbalance >1%; triggers + delta.
-# Retained v24.01.4: Bidirectional + EMA200 bias + FVG caution – no bias.
-# Retained v24.01.3: Added short entries (bearish EMA cross), vol threshold 1.5x, RSI filter (<30 long/>70 short), maintained precision.
-# Retained v24.01.2: Robust EMA-only computation in BTC trend to avoid empty DF from full indicators/dropna.
-# Retained v24.01.1: Increased limit=500 & len check in BTC trend; backoff*3; sem=3 for rate limit stability.
-# Retained v24.01: Fixed SyntaxError in query_grok_instant prompt (raw string for JSON example).
-# Retained v24.00: Str=3+ OBs only, dist=4%, conf>=90%, multi-TF align, 24h cooldown.
+# main.py - Grok Elite Signal Bot v24.02.0 - Daily Reversal Hunter: OB str2/3 + Liquidity Sweeps (Anti-Consol Edition)
+# UPGRADE (v24.02.0): Daily focus (1d prio); OB str2/3; liquidity sweeps as bounces; ADX consol filter (<25 skip); vol>1.1x, conf>=70%, dist<7%; simplified Grok/whale; more signals ~2x.
+# Retained v24.01.8: Order Flow enhanced; relaxed thresholds.
 import asyncio
 import os
 import ccxt.async_support as ccxt
@@ -26,10 +18,11 @@ from typing import Dict, Any, Optional, List
 import time
 from collections import OrderedDict
 import html
-import sys # NEW: For explicit exit in main()
+import sys  # For explicit exit in main()
+
 SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
 TIMEFRAMES = ['4h', '1d', '1w']
-CHECK_INTERVAL = 14400
+CHECK_INTERVAL = 7200  # NEW v24.02.0: 2h for more checks
 TRACK_INTERVAL = 5
 COOLDOWN_HOURS = 12
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -57,11 +50,11 @@ BACKTEST_FILE = "backtest_results.json"
 CACHE_TTL = 1800
 HTF_CACHE_TTL = 3600
 TICKER_CACHE_TTL = 10
-ORDER_FLOW_CACHE_TTL = 5 # NEW Order Flow: Short TTL for fresh book
+ORDER_FLOW_CACHE_TTL = 5  # Short TTL for fresh book
 MAX_CACHE_SIZE = 50
 ohlcv_cache: OrderedDict = OrderedDict()
 ticker_cache: OrderedDict = OrderedDict()
-order_flow_cache: OrderedDict = OrderedDict() # NEW: Cache for order books
+order_flow_cache: OrderedDict = OrderedDict()
 last_oi: Dict[str, float] = {}
 open_trades = {}
 protected_trades = {}
@@ -82,14 +75,16 @@ DAILY_ATR_MULT = 2.0
 SIMULATED_CAPITAL = 10000.0
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 fetch_sem = asyncio.Semaphore(3)
+
 def evict_if_full(cache: OrderedDict, max_size: int = MAX_CACHE_SIZE):
     """Evict oldest cache entries if size exceeds limit to prevent memory growth."""
     evicted = 0
     while len(cache) > max_size:
-        cache.popitem(last=False) # FIFO: oldest first
+        cache.popitem(last=False)  # FIFO: oldest first
         evicted += 1
     if evicted > 0:
         logging.debug(f"Evicted {evicted} items from {cache.__class__.__name__} cache (now {len(cache)} items)")
+
 class BanManager:
     ban_until: float = 0.0
     cooldown_until: float = 0.0
@@ -124,6 +119,7 @@ class BanManager:
         cls.ban_until = ban_ts_ms / 1000.0
         cls.cooldown_until = cls.ban_until + 3600
         logging.warning(f"Global ban updated: until {datetime.fromtimestamp(cls.ban_until).isoformat()} (+1h cooldown)")
+
 def load_stats() -> Dict[str, Any]:
     if os.path.exists(STATS_FILE):
         try:
@@ -135,14 +131,17 @@ def load_stats() -> Dict[str, Any]:
         except json.JSONDecodeError:
             logging.warning("Invalid stats file, resetting.")
     return {"wins": 0, "losses": 0, "pnl": 0.0, "capital": SIMULATED_CAPITAL, "drawdown": 0.0}
+
 def save_stats(s: Dict[str, Any]):
     try:
         with open(STATS_FILE, 'w') as f:
             json.dump(s, f, indent=2)
     except Exception as e:
         logging.error(f"Failed to save stats: {e}")
+
 stats = load_stats()
 stats_lock = asyncio.Lock()
+
 def load_trades() -> Dict[str, Any]:
     if os.path.exists(TRADES_FILE):
         try:
@@ -159,6 +158,7 @@ def load_trades() -> Dict[str, Any]:
         except (json.JSONDecodeError, KeyError) as e:
             logging.warning(f"Invalid trades file, resetting: {e}")
     return {}
+
 def save_trades(trades: Dict[str, Any]):
     try:
         dumpable = {}
@@ -173,6 +173,7 @@ def save_trades(trades: Dict[str, Any]):
             json.dump(dumpable, f, indent=2)
     except Exception as e:
         logging.error(f"Failed to save trades: {e}")
+
 def load_protected() -> Dict[str, Any]:
     if os.path.exists(PROTECTED_TRADES_FILE):
         try:
@@ -189,6 +190,7 @@ def load_protected() -> Dict[str, Any]:
         except (json.JSONDecodeError, KeyError) as e:
             logging.warning(f"Invalid protected trades file, resetting: {e}")
     return {}
+
 def save_protected(trades: Dict[str, Any]):
     try:
         dumpable = {}
@@ -203,13 +205,17 @@ def save_protected(trades: Dict[str, Any]):
             json.dump(dumpable, f, indent=2)
     except Exception as e:
         logging.error(f"Failed to save protected trades: {e}")
+
 open_trades = load_trades()
 protected_trades = load_protected()
+
 def get_clean_symbol(trade_key: str) -> str:
     return re.sub(r'roadmap\d+$', '', trade_key)
+
 def format_price(price: float) -> str:
     return f"{price:,.4f}"
-# NEW Order Flow: Fetch batch order books
+
+# Order Flow: Fetch batch order books (enhanced for walls)
 async def fetch_order_flow_batch() -> Dict[str, Dict]:
     async with fetch_sem:
         now = time.time()
@@ -220,12 +226,12 @@ async def fetch_order_flow_batch() -> Dict[str, Dict]:
         logging.debug(f"Partial cache hit for order flow ({cache_hits}/{len(SYMBOLS)}); polling fresh")
         if await BanManager.check_and_sleep():
             return {s: order_flow_cache.get(s, {}).get('book') for s in SYMBOLS}
-        evict_if_full(order_flow_cache) # NEW: Evict if full
+        evict_if_full(order_flow_cache)
         order_books = {}
         backoff = 1
         for attempt in range(3):
             try:
-                tasks = [exchange.fetch_order_book(s, limit=20) for s in SYMBOLS]
+                tasks = [exchange.fetch_order_book(s, limit=20) for s in SYMBOLS]  # NEW v24.02.0: limit=20 for deeper walls
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 for i, result in enumerate(results):
                     if not isinstance(result, Exception):
@@ -243,28 +249,54 @@ async def fetch_order_flow_batch() -> Dict[str, Dict]:
         else:
             order_books = {s: order_flow_cache.get(s, {}).get('book') for s in SYMBOLS}
         return order_books
-# NEW Order Flow: Calculate delta and footprint
+
+# NEW v24.02.0: Enhanced Order Flow - delta, footprint + walls/sweeps
 def calculate_order_flow(df: pd.DataFrame, order_book: Optional[Dict] = None) -> pd.DataFrame:
     if len(df) == 0 or not order_book:
         return df
     df = df.copy()
-    bids = order_book.get('bids', [])
-    asks = order_book.get('asks', [])
-    buy_vol = sum(amount for _, amount in bids) # Total buy volume top levels
-    sell_vol = sum(amount for _, amount in asks) # Total sell volume
+    bids = order_book.get('bids', [])[:5]  # Top 5 for walls
+    asks = order_book.get('asks', [])[:5]
+    buy_vol = sum(amount for _, amount in bids)
+    sell_vol = sum(amount for _, amount in asks)
     total_vol = buy_vol + sell_vol
-    delta = (buy_vol - sell_vol) / total_vol * 100 if total_vol > 0 else 0 # % imbalance
-    df['order_delta'] = delta # Single value, repeat for df
-    df['order_delta'] = df['order_delta'].fillna(delta) # Fill NaN
-    # Cumulative delta (simple rolling)
+    delta = (buy_vol - sell_vol) / total_vol * 100 if total_vol > 0 else 0
+    # NEW: Wall detection - imbalance >2% in top levels
+    wall_imbalance = abs(delta) > 2.0
+    df['order_delta'] = delta
+    df['order_delta'] = df['order_delta'].fillna(delta)
     df['cum_delta'] = df['order_delta'].rolling(window=5, min_periods=1).sum()
-    # Footprint imbalance: High if >10 active levels in 1% range
+    # Footprint: active levels in 1%
     mid_price = df['close'].iloc[-1]
     active_levels = len([p for p, _ in bids + asks if abs(p - mid_price) / mid_price < 0.01])
-    df['footprint_imbalance'] = active_levels > 10 # Bool, repeat
+    df['footprint_imbalance'] = active_levels > 10
     df['footprint_imbalance'] = df['footprint_imbalance'].fillna(True if active_levels > 10 else False)
-    logging.debug(f"Order flow delta: {delta:.2f}% | Footprint: {active_levels} levels")
+    # NEW: Liquidity sweep detection - wick beyond recent high/low + reversal
+    recent_high = df['high'].rolling(10).max().iloc[-1]
+    recent_low = df['low'].rolling(10).min().iloc[-1]
+    current_close = df['close'].iloc[-1]
+    current_high = df['high'].iloc[-1]
+    current_low = df['low'].iloc[-1]
+    sweep_high = current_high > recent_high and current_close < current_high * 0.999  # Reversal after sweep
+    sweep_low = current_low < recent_low and current_close > current_low * 1.001
+    df['liq_sweep'] = (sweep_high or sweep_low)  # Bool for bounce potential
+    df['liq_sweep'] = df['liq_sweep'].fillna(sweep_high or sweep_low)
+    logging.debug(f"Order flow: delta {delta:.2f}% | Wall: {wall_imbalance} | Footprint: {active_levels} | Sweep: {sweep_high or sweep_low}")
     return df
+
+# NEW v24.02.0: Consolidation filter with ADX
+def is_consolidation(df: pd.DataFrame) -> bool:
+    if len(df) < 14:
+        return True  # Default safe
+    adx = ta.adx(df['high'], df['low'], df['close'], length=14)
+    if adx is None or 'ADX_14' not in adx.columns:
+        return False
+    adx_val = adx['ADX_14'].iloc[-1]
+    vol_ratio = df['volume'].iloc[-1] / df['volume'].rolling(20).mean().iloc[-1]
+    consol = (adx_val < 25) and (vol_ratio < 1.1)  # Low trend + low vol = consol
+    logging.info(f"Consol check: ADX={adx_val:.1f}, vol_ratio={vol_ratio:.2f} -> {consol}")
+    return consol
+
 async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logging.info(f"/backtest triggered by user {update.effective_user.id}")
     try:
@@ -278,12 +310,14 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         df = add_indicators(df)
         trades = []
         capital = stats['capital']
-        # Przeniesione poza pętlę dla efektywności
         for i in range(100, len(df)):
-            # NEW v24.01.4: Symmetric vol >1.5x for long (from >2x if was, but already 1.5)
-            if (df['ema50'].iloc[i] > df['ema200'].iloc[i] and # NEW: EMA200 bias for long
+            # NEW v24.02.0: vol >1.1x, consol skip, EMA200 bias
+            df_slice = df.iloc[:i+1]
+            if is_consolidation(df_slice):
+                continue
+            if (df['ema50'].iloc[i] > df['ema200'].iloc[i] and  # EMA200 bias
                 df['ema50'].iloc[i-1] <= df['ema100'].iloc[i-1] and
-                df['volume'].iloc[i] > 1.5 * df['volume_sma'].iloc[i]):
+                df['volume'].iloc[i] > 1.1 * df['volume_sma'].iloc[i]):  # RELAXED vol
                 entry = df['close'].iloc[i]
                 sl = entry * 0.98
                 tp = entry * 1.06
@@ -305,15 +339,15 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     diff = df['close'].iloc[-1] - entry
                     pnl_usdt = diff * size - 2 * FEE_PCT * entry * size
                     trades.append({'result': 'open', 'pnl': pnl_usdt})
-            # NEW v24.01.3: Short entry (bearish cross) - Retained for v24.01.4 symmetry + EMA200 filter
-            if df['ema200'].iloc[i] > df['close'].iloc[i]: # NEW: EMA200 bias for short (below)
-                continue # No counter-trend short
+            # Short: symmetric, with consol skip
+            if df['ema200'].iloc[i] > df['close'].iloc[i]:  # Bias below for short
+                continue
             elif (df['ema50'].iloc[i] < df['ema100'].iloc[i] and
                   df['ema50'].iloc[i-1] >= df['ema100'].iloc[i-1] and
-                  df['volume'].iloc[i] > 1.5 * df['volume_sma'].iloc[i]): # NEW: vol >1.5x (z 2x)
+                  df['volume'].iloc[i] > 1.1 * df['volume_sma'].iloc[i]):
                 entry = df['close'].iloc[i]
-                sl = entry * 1.03 # NEW: SL above for short
-                tp = entry * 0.96 # NEW: TP below
+                sl = entry * 1.03
+                tp = entry * 0.96
                 risk_distance = sl - entry
                 size = (capital * RISK_PER_TRADE_PCT / 100) / risk_distance if risk_distance > 0 else 0
                 for j in range(i+1, len(df)):
@@ -337,7 +371,7 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         winrate = (wins / total * 100) if total > 0 else 0
         total_pnl = sum(t['pnl'] for t in trades)
         sharpe = np.mean([t['pnl'] for t in trades]) / (np.std([t['pnl'] for t in trades]) or np.inf) if trades else 0
-        msg = f"**Institutional Backtest (90d BTC/USDT 1d)**\n\nWins: {wins}/{total} ({winrate:.1f}%)\nTotal PnL: {total_pnl:+.2f} ({total_pnl/capital*100:.2f}%)\nSharpe Ratio: {sharpe:.2f}"
+        msg = f"**Daily Backtest (90d BTC/USDT 1d)**\n\nWins: {wins}/{total} ({winrate:.1f}%)\nTotal PnL: {total_pnl:+.2f} ({total_pnl/capital*100:.2f}%)\nSharpe Ratio: {sharpe:.2f}"
         await update.message.reply_text(msg, parse_mode='Markdown')
         bt_results = {'winrate': winrate, 'total_pnl': total_pnl, 'sharpe': sharpe, 'date': datetime.now(timezone.utc).isoformat()}
         with open(BACKTEST_FILE, 'w') as f:
@@ -346,35 +380,29 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"/backtest error: {e}")
         await update.message.reply_text(f"Backtest failed: {str(e)}", parse_mode='Markdown')
+
 async def send_welcome_once():
     if not os.path.exists(FLAG_FILE):
         try:
             welcome_text = (
-                "**Grok Elite Bot v24.01.8 ONLINE ♔** – Institutional OB Hunter: Zero Noise (Order Flow Enhanced + Env Debug + Relaxed Roadmap + Low-Vol Unlock)\n\n"
-                "• v24.01.8: Vol>1.2x (from 1.5x), delta>0.5% (from 1%), min 1 trigger (from 2) for low-vol roadmaps; all triggers log.\n"
-                "• v24.01.7: Relaxed roadmap (conf>80, dist<6%, prob>=80, triggers>=2) for earlier signals, minimal accuracy loss.\n"
-                "• v24.01.6: Env debug logs; query_grok_instant upgrade (str=2+, conf≥75%, lev3-7x); backtest symmetry; order_flow cache eviction.\n"
-                "• v24.01.5: Order Flow (delta + footprint via ccxt book); conf +2 on imbalance >1%; triggers + delta for absorpcja confirm.\n"
-                "• v24.01.4: Symmetric short/long (EMA cross both ways vol>1.5x), EMA200 1d trend filter (long above, short below, neutral +1 conf), reversal caution (FVG<0.3% or breaker no mit before entry), zero long bias.\n"
-                "• v24.01.3: Short entries (bearish cross), vol 1.5x (+20-30% triggers), RSI <30 long/>70 short, precision 90%+ RR3:1 str3 24h CD.\n"
-                "• v24.01.2: EMA-only robust computation in BTC trend (no full indicators/dropna empty DF).\n"
-                "• v24.01.1: BTC trend robustness (limit=500, len check, backoff*3, sem=3).\n"
-                "• v24.01: Fixed prompt syntax in Grok query.\n"
-                "• v24.00: Str=3+ OBs only (HTF vol/disp confirmed); dist=4%; conf>=90%; multi-TF align; 24h cooldown.\n"
-                "• All: Pure institutional ICT, 24-72h+ horizon, whale footprints prioritized."
+                "**Grok Elite Bot v24.02.0 ONLINE ♔** – Daily Reversal Hunter: OB str2/3 + Liq Sweeps (Anti-Consol)\n\n"
+                "• v24.02.0: Daily 1d focus; str>=2 OBs; liq sweeps as bounces; ADX consol skip; vol>1.1x, conf>=70%, dist<7%; ~2x more signals.\n"
+                "• Retained: Order Flow walls/delta; relaxed thresholds.\n"
+                "• All: ICT daily, reversals prio, no range noise."
             )
             escaped_text = html.escape(welcome_text)
             await bot.send_message(CHAT_ID, escaped_text, parse_mode='HTML')
             open(FLAG_FILE, "w").close()
-            logging.info("Welcome sent (v24.01.8)")
+            logging.info("Welcome sent (v24.02.0)")
         except Exception as e:
             logging.error(f"Failed to send welcome: {e}")
+
 async def query_grok_instant(context: str, is_alt: bool = False) -> Dict[str, Any]:
     models = ["grok-4", "grok-3"]
-    example_json = r'{"symbol":"BTC","direction":"Long" or "Short","entry_low":68234.5678,"entry_high":68456.1234,"sl":67987.2345,"tp1":68890.7890,"tp2":69543.4567,"leverage":3-7,"confidence":75-98,"strength":2,"reason":"concise daily reason (max 80 chars, e.g., HTF OB + vol on 1d)"}'
+    example_json = r'{"symbol":"BTC","direction":"Long" or "Short","entry_low":68234.5678,"entry_high":68456.1234,"sl":67987.2345,"tp1":68890.7890,"tp2":69543.4567,"leverage":3-7,"confidence":70-98,"strength":2,"reason":"concise daily reason (max 80 chars, e.g., HTF OB + vol on 1d)"}'
     system_prompt = (
         "You are an institutional whale trader spotting large footprints for daily trading. Output ONLY valid JSON. "
-        "High-conviction institutional OB setup ≥75% confidence (str=2+ only) → exact format:\n"
+        "High-conviction institutional OB setup ≥70% confidence (str=2+ only) → exact format:\n"
         f"{example_json}\n"
         "Ignore retail noise: Require HTF (1d/1w) vol-confirmed displacement, unmitigated str=2+ OB, multi-TF align (priorytet 1d/1w), RSI exhaustion. "
         "Precise levels (4+ decimals), no rounds. Boost if whale OI/flows + POC align. Conservative: lev 3-7x, SL ATR*2, 12h+ horizon for daily swings.\n"
@@ -416,6 +444,7 @@ async def query_grok_instant(context: str, is_alt: bool = False) -> Dict[str, An
             if model == models[-1]:
                 return {"error": str(e)}
     return {"error": "All models failed"}
+
 def check_precision(trade: Dict[str, Any]) -> bool:
     price_keys = ['entry_low', 'entry_high', 'sl', 'tp1', 'tp2']
     for key in price_keys:
@@ -425,24 +454,25 @@ def check_precision(trade: Dict[str, Any]) -> bool:
                 logging.warning(f"Precision fail: {key}={p} too round")
                 return False
     return True
+
 def check_rr(trade: Dict[str, Any]) -> bool:
     entry_mid = (trade['entry_low'] + trade['entry_high']) / 2
     rr2 = abs(trade['tp2'] - entry_mid) / abs(trade['sl'] - entry_mid)
     return rr2 >= 2.0
+
+# Update query_grok_potential: Simplified prompt, focus daily/OB/liquidity
 async def query_grok_potential(zones: List[Dict], symbol: str, current_price: float, trend: str, btc_trend: Optional[str], atr: float = 0) -> Dict[str, Any]:
     is_alt = symbol != 'BTC/USDT'
-    filtered_zones = [z for z in zones if z.get('strength', 0) >= 3 and z.get('prob', 0) >= 80] # RELAXED: from >=85 to >=80
+    filtered_zones = [z for z in zones if z.get('strength', 0) >= 2 and z.get('prob', 0) >= 70]  # RELAXED v24.02.0
     if not filtered_zones:
         return {"no_live_trade": True, "roadmap": []}
     zone_summary = "\n".join([f"{z['direction']}: {z['zone_low']:.4f}-{z['zone_high']:.4f} ({z['confluence']}, {z['prob']}% prob, {z['dist_pct']:.1f}% away, str{z['strength']})" for z in filtered_zones])
-    context = f"{symbol} | Price: {current_price:.4f} | Trend: {trend} {'| BTC: ' + btc_trend if is_alt else ''}\nInst Zones:\n{zone_summary}"
+    context = f"{symbol} | Price: {current_price:.4f} | Trend: {trend} {'| BTC: ' + btc_trend if is_alt else ''}\nDaily Zones:\n{zone_summary}"
     system_prompt = (
-        "You are an ICT whale analyst. Focus ONLY on institutional str=2+ OBs (vol-disp confirmed, unmitigated).\n"
-        "Output ONLY valid JSON: If price in ≥75% inst zone (multi-TF align) → {'live_trade': {direction, entry_low, entry_high, sl, tp1, tp2, leverage:2-5, confidence≥75, strength:2, reason}}.\n"
-        "Else: {'no_live_trade': true, 'roadmap': [{'direction': 'Long/Short', 'entry_low': x, 'entry_high': y, 'sl': z, 'tp1': a, 'tp2': b, 'leverage': 2-5, 'confidence': 75-98, 'strength':2, 'reason': 'max 60 chars (inst only)', 'dist_pct': d}]} # Top 1-2 elite zones\n"
-        f"Precise 4 decimals (e.g., 3053.4567). Require HTF POC/VWAP align, whale flows. "
-        f"{'Alts: Strict BTC align; no counter-trend.' if is_alt else ''}\n"
-        "Conservative: Risk <5%, SL ATR*2 behind OB, TP1:1:2 R:R, TP2:1:3+ at next inst level. Ensure low < high."
+        "You are ICT daily reversal analyst. Focus on OB str2/3, liquidity sweeps as bounces, order walls. Output ONLY JSON. "
+        "If price near zone (>=70% conf, multi-TF 1d align) → {'live_trade': {direction, entry_low, entry_high, sl, tp1, tp2, leverage:3-7, confidence>=70, strength:2-3, reason: 'concise (OB/liq reversal)'}}. "
+        "Else: {'no_live_trade': true, 'roadmap': [zones list]} Top 1-3 daily setups. Precise levels, SL ATR*2, R:R 1:2+. No consol signals."
+        f"Alts: BTC align only. No trade if consol."
     )
     models = ["grok-4", "grok-3"]
     for model in models:
@@ -452,7 +482,7 @@ async def query_grok_potential(zones: List[Dict], symbol: str, current_price: fl
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": context}
             ],
-            "temperature": 0.05,
+            "temperature": 0.1,  # Slightly higher for variety
             "max_tokens": 400
         }
         attempt = 0
@@ -468,7 +498,7 @@ async def query_grok_potential(zones: List[Dict], symbol: str, current_price: fl
                         precise = False
                     if 'roadmap' in result:
                         for z in result['roadmap']:
-                            if (not check_precision(z) or not check_rr(z) or z.get('strength', 0) < 2 or z.get('confidence', 0) < 75):
+                            if (not check_precision(z) or not check_rr(z) or z.get('strength', 0) < 2 or z.get('confidence', 0) < 70):  # RELAXED
                                 precise = False
                                 break
                     if precise:
@@ -487,6 +517,7 @@ async def query_grok_potential(zones: List[Dict], symbol: str, current_price: fl
         if attempt == 2:
             continue
     return {"error": "All models failed"}
+
 async def fetch_open_interest(symbol: str) -> Optional[Dict[str, float]]:
     async with fetch_sem:
         if await BanManager.check_and_sleep():
@@ -519,6 +550,7 @@ async def fetch_open_interest(symbol: str) -> Optional[Dict[str, float]]:
             logging.error(f"OI fetch error for {symbol}: {e}")
             await asyncio.sleep(5)
             return None
+
 async def fetch_ohlcv(symbol: str, tf: str, limit: int = 200, since: Optional[int] = None) -> pd.DataFrame:
     async with fetch_sem:
         if await BanManager.check_and_sleep():
@@ -552,14 +584,15 @@ async def fetch_ohlcv(symbol: str, tf: str, limit: int = 200, since: Optional[in
             except Exception as e:
                 logging.warning(f"OHLCV fetch attempt {attempt+1} failed for {symbol} {tf}: {e}")
                 if attempt < 3:
-                    await asyncio.sleep(backoff * 3) # Wzmocniony backoff *3
+                    await asyncio.sleep(backoff * 3)
                     backoff *= 3
                 else:
                     logging.warning(f"OHLCV fetch failed all attempts for {symbol} {tf}: using cache/empty")
                     break
-        sleep_time = 3 if success else 5 # Zwiększony sleep po sukcesie
+        sleep_time = 3 if success else 5
         await asyncio.sleep(sleep_time)
         return ohlcv_cache.get(cache_key, {}).get('df', pd.DataFrame())
+
 async def fetch_ticker_batch() -> Dict[str, Optional[float]]:
     async with fetch_sem:
         now = time.time()
@@ -595,15 +628,17 @@ async def fetch_ticker_batch() -> Dict[str, Optional[float]]:
         else:
             prices = {s: ticker_cache.get(s, {}).get('price') for s in SYMBOLS}
         return prices
+
 async def fetch_ticker(symbol: str) -> Optional[float]:
     prices = await fetch_ticker_batch()
     return prices.get(symbol)
+
 async def price_background_task():
     """Background task: Polls tickers and order flow every 10s for fresh prices/data."""
     while True:
         try:
             prices = await fetch_ticker_batch()
-            order_books = await fetch_order_flow_batch() # NEW: Add order flow polling
+            order_books = await fetch_order_flow_batch()
             if any(p is not None for p in prices.values()):
                 prices_global.update(prices)
                 logging.debug(f"Background poll update: {prices_global}")
@@ -613,13 +648,14 @@ async def price_background_task():
         except Exception as e:
             logging.warning(f"Background poll error (retrying): {e}")
             await asyncio.sleep(5)
-def add_indicators(df: pd.DataFrame, order_book: Optional[Dict] = None) -> pd.DataFrame: # NEW: Accept order_book
+
+def add_indicators(df: pd.DataFrame, order_book: Optional[Dict] = None) -> pd.DataFrame:
     if len(df) == 0:
         return df
     df = df.copy()
     df['ema50'] = ta.ema(df['close'], 50)
     df['ema100'] = ta.ema(df['close'], 100)
-    df['ema200'] = ta.ema(df['close'], 200) # Retained: EMA200 for trend filter
+    df['ema200'] = ta.ema(df['close'], 200)
     df['rsi'] = ta.rsi(df['close'], 14)
     df['volume_sma'] = df['volume'].rolling(20).mean()
     macd_data = ta.macd(df['close'])
@@ -643,12 +679,13 @@ def add_indicators(df: pd.DataFrame, order_book: Optional[Dict] = None) -> pd.Da
             df['stoch_k'] = stoch.iloc[:, 0]
             df['stoch_d'] = stoch.iloc[:, 1]
         df['vwap'] = ta.vwap(df['high'], df['low'], df['close'], df['volume'])
-    # NEW Order Flow: Calculate delta/footprint
+    # Order Flow: Calculate delta/footprint/sweep
     df = calculate_order_flow(df, order_book)
-    key_cols = ['ema50', 'ema100', 'rsi', 'volume_sma', 'macd', 'macd_signal', 'supertrend_dir', 'vwap', 'ema200', 'order_delta', 'cum_delta'] # NEW: Include order flow cols
+    key_cols = ['ema50', 'ema100', 'rsi', 'volume_sma', 'macd', 'macd_signal', 'supertrend_dir', 'vwap', 'ema200', 'order_delta', 'cum_delta', 'liq_sweep']  # NEW: + liq_sweep
     subset_key = [col for col in key_cols if col in df.columns]
     df = df.dropna(subset=subset_key)
     return df
+
 def zones_overlap(z1_low: float, z1_high: float, z2_low: float, z2_high: float, threshold: float = 0.5) -> float:
     o_low = max(z1_low, z2_low)
     o_high = min(z1_high, z2_high)
@@ -657,6 +694,8 @@ def zones_overlap(z1_low: float, z1_high: float, z2_low: float, z2_high: float, 
     overlap_len = o_high - o_low
     min_width = min(z1_high - z1_low, z2_high - z2_low)
     return (overlap_len / min_width)
+
+# Update find_unmitigated_order_blocks: Allow str=2
 async def find_unmitigated_order_blocks(df: pd.DataFrame, lookback: int = 100, atr_mult: float = 2.0, tf: str = None, symbol: str = None) -> Dict[str, List[Dict]]:
     if len(df) < 30:
         return {'bullish': [], 'bearish': []}
@@ -667,7 +706,7 @@ async def find_unmitigated_order_blocks(df: pd.DataFrame, lookback: int = 100, a
     df_local['direction'] = np.where(df_local['close'] > df_local['open'], 1, -1)
     df_local['swing_high'] = df_local['high'].rolling(10, center=True).max() == df_local['high']
     df_local['swing_low'] = df_local['low'].rolling(10, center=True).min() == df_local['low']
-    df_local['vol_surge'] = df_local['volume'] > 1.2 * df_local['volume'].rolling(20).mean()
+    df_local['vol_surge'] = df_local['volume'] > 1.1 * df_local['volume'].rolling(20).mean()  # RELAXED v24.02.0: 1.1x
     logging.info(f"Vol surge detected: {sum(df_local['vol_surge'])} in {len(df_local)} bars")
     df_local['volume_sma'] = df_local['volume'].rolling(20).mean()
     obs = {'bullish': [], 'bearish': []}
@@ -679,8 +718,8 @@ async def find_unmitigated_order_blocks(df: pd.DataFrame, lookback: int = 100, a
             if move_down and abs((ob_low - df_local['low'].iloc[i+5:i+10].min()) / ob_low) > 0.02:
                 mitigated = any(df_local['high'].iloc[i+1:] > ob_high)
                 zone_type = 'Breaker' if any(df_local['low'].iloc[i+1:i+6] < ob_low) else 'OB'
-                strength = 3 if zone_type == 'OB' and df_local['volume'].iloc[i] > 1.2 * df_local['volume_sma'].iloc[i] else 2
-                if not mitigated and strength == 3:
+                strength = 3 if zone_type == 'OB' and df_local['volume'].iloc[i] > 1.1 * df_local['volume_sma'].iloc[i] else 2  # NEW v24.02.0: str=2 allowed
+                if not mitigated and strength >= 2:  # RELAXED: >=2
                     obs['bearish'].append({
                         'low': ob_low, 'high': ob_high, 'type': zone_type,
                         'strength': strength, 'index': i, 'mitigated': False
@@ -693,12 +732,13 @@ async def find_unmitigated_order_blocks(df: pd.DataFrame, lookback: int = 100, a
             if move_up and abs((df_local['high'].iloc[i+5:i+10].max() - ob_high) / ob_high) > 0.02:
                 mitigated = any(df_local['low'].iloc[i+1:] < ob_low)
                 zone_type = 'Breaker' if any(df_local['high'].iloc[i+1:i+6] > ob_high) else 'OB'
-                strength = 3 if zone_type == 'OB' and df_local['volume'].iloc[i] > 1.2 * df_local['volume_sma'].iloc[i] else 2
-                if not mitigated and strength == 3:
+                strength = 3 if zone_type == 'OB' and df_local['volume'].iloc[i] > 1.1 * df_local['volume_sma'].iloc[i] else 2  # NEW: str=2
+                if not mitigated and strength >= 2:  # RELAXED
                     obs['bullish'].append({
                         'low': ob_low, 'high': ob_high, 'type': zone_type,
                         'strength': strength, 'index': i, 'mitigated': False
                     })
+    # HTF merge (retained, but limit to 3 per type) NEW: [:3]
     if tf in ['1d', '1w'] and symbol:
         try:
             df_1h = await fetch_ohlcv(symbol, '1h', 200)
@@ -716,35 +756,32 @@ async def find_unmitigated_order_blocks(df: pd.DataFrame, lookback: int = 100, a
                                 'low': merged_low, 'high': merged_high, 'type': ob_htf['type'],
                                 'strength': merged_strength, 'index': ob_htf['index'], 'mitigated': False
                             })
-                            logging.info(f"Merged inst {ob_type} OB for {symbol} {tf}: overlap {overlap_ratio:.2f}")
-                obs[ob_type] = merged[:2]
+                            logging.info(f"Merged {ob_type} OB for {symbol} {tf}: overlap {overlap_ratio:.2f}")
+                obs[ob_type] = merged[:3]  # NEW v24.02.0: Up to 3 for more options
         except Exception as e:
             logging.warning(f"HTF 1h verify failed for {symbol} {tf}: {e}")
     for key in obs:
-        obs[key] = sorted(obs[key], key=lambda z: (len(df_local) - z['index']) * z['strength'], reverse=True)[:2]
+        obs[key] = sorted(obs[key], key=lambda z: (len(df_local) - z['index']) * z['strength'], reverse=True)[:3]  # NEW: [:3]
     return obs
-async def find_next_premium_zones(df: pd.DataFrame, current_price: float, tf: str, symbol: str = None, oi_data: Optional[Dict[str, float]] = None, trend: str = None, whale_data: Optional[Dict[str, Any]] = None, order_book: Optional[Dict] = None) -> List[Dict]: # NEW: Accept order_book
+
+# Update find_next_premium_zones: str>=2, liq sweep boost, consol skip
+async def find_next_premium_zones(df: pd.DataFrame, current_price: float, tf: str, symbol: str = None, oi_data: Optional[Dict[str, float]] = None, trend: str = None, whale_data: Optional[Dict[str, Any]] = None, order_book: Optional[Dict] = None) -> List[Dict]:
     if len(df) < 50:
         return []
-    df = add_indicators(df, order_book) # Pass order_book for delta calc
-    # Retained: EMA200 for 1d trend bias
+    df = add_indicators(df, order_book)
+    # NEW v24.02.0: Consol filter first
+    if is_consolidation(df):
+        logging.info(f"Skipped {symbol} {tf}: Consolidation detected")
+        return []
+    # EMA200 bias (retained)
     if 'ema200' not in df.columns or df['ema200'].isna().all():
         df['ema200'] = ta.ema(df['close'], 200)
         df = df.dropna(subset=['ema200'])
     ema200_val = df['ema200'].iloc[-1]
     price_current = df['close'].iloc[-1]
-    if price_current > ema200_val:
-        trend_bias = 'bull' # Long favor
-    elif price_current < ema200_val:
-        trend_bias = 'bear' # Short favor
-    else:
-        trend_bias = 'neutral' # Both, +1 conf
-    if tf in ['1d', '1w']: # Daily focus
-        if trend_bias == 'bull' and direction == 'Long':
-            conf_score += 2.0 # Mocniejszy boost dla HTF
-        elif trend_bias == 'bear' and direction == 'Short':
-            conf_score += 2.0
-    logging.info(f"EMA200 bias for {symbol} {tf}: {trend_bias} (price {price_current:.4f} vs EMA {ema200_val:.4f})")
+    trend_bias = 'bull' if price_current > ema200_val else 'bear' if price_current < ema200_val else 'neutral'
+    logging.info(f"EMA200 bias for {symbol} {tf}: {trend_bias}")
+    # RSI HTF (retained)
     rsi_1d = None
     rsi_1w = None
     if symbol:
@@ -757,6 +794,7 @@ async def find_next_premium_zones(df: pd.DataFrame, current_price: float, tf: st
             rsi_1w = df_1w['rsi'].iloc[-1] if len(df_1w) > 0 and 'rsi' in df_1w.columns else None
         except Exception as e:
             logging.error(f"HTF RSI fetch error for {symbol}: {e}")
+    # HTF align (focus 1d)
     tf_trend = trend
     htf_align = 1.0
     if tf in ['4h', '1d', '1w']:
@@ -766,39 +804,33 @@ async def find_next_premium_zones(df: pd.DataFrame, current_price: float, tf: st
             l4h = df_4h.iloc[-1]
             if (l4h['ema50'] > l4h['ema100'] and tf_trend == 'Uptrend') or (l4h['ema50'] < l4h['ema100'] and tf_trend == 'Downtrend'):
                 htf_align += 1.5
-            else:
-                return []
-    htf_mult = htf_align if tf in ['1d', '1w'] else 1.0
+    htf_mult = htf_align if tf == '1d' else 1.0  # NEW v24.02.0: Stronger 1d mult
     obs = await find_unmitigated_order_blocks(df, tf=tf, symbol=symbol)
-    elite_obs = {k: [o for o in v if o['strength'] == 3] for k, v in obs.items()}
+    elite_obs = {k: [o for o in v if o['strength'] >= 2] for k, v in obs.items()}  # RELAXED v24.02.0: >=2
     liq_profile = calc_liquidity_profile(df)
     poc = max(liq_profile.items(), key=lambda x: x[1])[0] if liq_profile else None
-    zones_4pct = []
-    buffer_mult = 0.04 if trend == 'Downtrend' else 0.06
+    zones_7pct = []  # RELAXED: 7%
+    buffer_mult = 0.05 if trend == 'Downtrend' else 0.07  # RELAXED
     long_buffer = current_price * buffer_mult
     short_buffer = current_price * buffer_mult
     for ob in elite_obs.get('bullish', []):
         mid = (ob['low'] + ob['high']) / 2
         dist_pct = abs(current_price - mid) / current_price * 100
-        if mid < current_price - long_buffer and dist_pct <= 4.0:
-            zones_4pct.append(ob)
+        if mid < current_price - long_buffer and dist_pct <= 7.0:  # RELAXED
+            zones_7pct.append(ob)
     for ob in elite_obs.get('bearish', []):
         mid = (ob['low'] + ob['high']) / 2
         dist_pct = abs(current_price - mid) / current_price * 100
-        if mid > current_price + short_buffer and dist_pct <= 4.0:
-            zones_4pct.append(ob)
-    zones_to_use = zones_4pct
-    logging.info(f"Using 4% elite zones for {symbol} {tf}: {len(zones_to_use)} str=3 OBs")
+        if mid > current_price + short_buffer and dist_pct <= 7.0:
+            zones_7pct.append(ob)
+    zones_to_use = zones_7pct
+    logging.info(f"Using 7% zones for {symbol} {tf}: {len(zones_to_use)} str>=2 OBs")
     zones = []
     for ob in zones_to_use:
         mid = (ob['low'] + ob['high']) / 2
         dist = abs(current_price - mid) / current_price * 100
-        conf_score = ob['strength'] * htf_mult
-        if 'vwap' in df.columns and not pd.isna(df['vwap'].iloc[-1]) and abs(mid - df['vwap'].iloc[-1]) / current_price * 100 < 0.5:
-            conf_score += 1.5
-            confluence_str = ob['type'] + "+VWAP"
-        else:
-            confluence_str = ob['type']
+        conf_score = ob['strength'] * htf_mult  # str2 = lower base
+        confluence_str = ob['type']
         if poc and abs(mid - poc) / current_price * 100 < 0.3:
             conf_score += 2
             confluence_str += "+POC"
@@ -806,70 +838,72 @@ async def find_next_premium_zones(df: pd.DataFrame, current_price: float, tf: st
         if oi_data and oi_data['oi_change_pct'] > 10:
             conf_score += 1.5
             oi_str = "+Whale OI"
-        whale_str = ""
-        if whale_data and whale_data['boost'] > 1:
-            conf_score += whale_data['boost']
-            whale_str = whale_data['reason']
         if 'supertrend_dir' in df.columns and df['supertrend_dir'].iloc[-1] == (1 if 'bullish' in str(ob) else -1):
             conf_score += 1
             confluence_str += "+ST Align"
         if liq_profile and liq_profile.get(mid, 0) > 1.5:
             conf_score += 1.5
             confluence_str += "+High Liq"
-        confluence_str += oi_str + whale_str
+        confluence_str += oi_str
+        # RSI boost (retained)
         rsi_os_boost = 0
         direction = 'Long' if 'bullish' in str(ob.get('type', '')) else 'Short'
-        if ((rsi_1d and rsi_1d < 35) or (rsi_1w and rsi_1w < 35)) and ob['strength'] == 3 and direction == 'Long': # NEW: RSI<30 for long
+        if ((rsi_1d and rsi_1d < 35) or (rsi_1w and rsi_1w < 35)) and ob['strength'] >= 2 and direction == 'Long':
             rsi_os_boost = 1.5
             confluence_str += "+RSI Exhaust Long"
-        elif ((rsi_1d and rsi_1d > 65) or (rsi_1w and rsi_1w > 65)) and ob['strength'] == 3 and direction == 'Short': # NEW: RSI>70 for short
+        elif ((rsi_1d and rsi_1d > 65) or (rsi_1w and rsi_1w > 65)) and ob['strength'] >= 2 and direction == 'Short':
             rsi_os_boost = 1.5
             confluence_str += "+RSI Exhaust Short"
         else:
-            confluence_str += "+RSI Neutral" # NEW: Fallback
+            confluence_str += "+RSI Neutral"
         conf_score += rsi_os_boost
-        # Retained: Trend bias boost
+        # Trend bias (retained)
         if trend_bias == 'bull' and direction == 'Long':
-            conf_score += 1.5 # Bias boost
+            conf_score += 1.5
         elif trend_bias == 'bear' and direction == 'Short':
             conf_score += 1.5
         elif trend_bias == 'neutral':
             conf_score += 1
-        # Retained: Reversal caution
+        # Reversal caution (retained)
         fvgs = detect_fvg(df, tf, proximity_pct=0.3)
         obs_key = 'bullish' if direction == 'Long' else 'bearish'
-        breaker_confirmed = any('Breaker' in ob['type'] for ob in elite_obs.get(obs_key, [])) # Pseudo-check
-        if fvgs or breaker_confirmed:
-            reversal_caution = True
+        breaker_confirmed = any('Breaker' in ob['type'] for ob in elite_obs.get(obs_key, []))
+        reversal_caution = fvgs or breaker_confirmed
+        if reversal_caution:
             conf_score += 1.5
             confluence_str += "+FVG/Breaker Caution"
         else:
             reversal_caution = False
         aligned_bias = 'bull' if direction == 'Long' else 'bear'
-        if trend_bias != 'neutral' and trend_bias != aligned_bias and not reversal_caution: # Skip counter-trend without confirm
+        if trend_bias != 'neutral' and trend_bias != aligned_bias and not reversal_caution:  # Skip counter-trend without confirm
             logging.info(f"Skipped counter-trend {direction} for {symbol} {tf}: bias {trend_bias}, no caution")
             continue
-        # NEW Order Flow: Boost on delta imbalance >1%
+        # Order Flow boosts (retained + sweep)
         delta = df['order_delta'].iloc[-1]
         if abs(delta) > 1.0:
             conf_score += 2
-            confluence_str += f"+Order Flow Delta {delta:.1f}%"
-        # Footprint imbalance boost
+            confluence_str += f"+Delta {delta:.1f}%"
         if df['footprint_imbalance'].iloc[-1]:
             conf_score += 1
-            confluence_str += "+Footprint Imbalance"
-        prob = min(98, 70 + conf_score * 8)
+            confluence_str += "+Footprint"
+        # NEW v24.02.0: Liq sweep as bounce
+        if df['liq_sweep'].iloc[-1]:
+            conf_score += 2
+            confluence_str += "+Liq Sweep Bounce"
+            logging.info(f"Liq sweep bounce boost for {symbol} {direction}")
+        prob = min(98, 60 + conf_score * 7)  # RELAXED v24.02.0: base 60, *7 for more
         direction = 'Long' if 'bullish' in str(ob.get('type', '')) else 'Short'
         zones.append({
             'direction': direction, 'zone_low': ob['low'], 'zone_high': ob['high'],
             'confluence': confluence_str, 'dist_pct': dist, 'prob': prob, 'strength': ob['strength']
         })
-    zones = sorted(zones, key=lambda z: z['dist_pct'])[:2]
-    zones = [z for z in zones if z['prob'] >= 75]
+    zones = sorted(zones, key=lambda z: z['dist_pct'])[:3]  # NEW: Up to 3
+    zones = [z for z in zones if z['prob'] >= 70]  # RELAXED: 70%
     if len(zones) < 2 and tf not in ['1w']:
         zones = []
-    logging.info(f"Filtered to {len(zones)} elite zones >=75% for {symbol} {tf}")
+    logging.info(f"Filtered to {len(zones)} elite zones >=70% for {symbol} {tf}")
     return zones
+
 def calc_liquidity_profile(df: pd.DataFrame, bins: int = 15) -> Dict[float, float]:
     if len(df) < 50:
         return {}
@@ -890,6 +924,7 @@ def calc_liquidity_profile(df: pd.DataFrame, bins: int = 15) -> Dict[float, floa
     else:
         hot_zones = {k: v / threshold if v > threshold else 0 for k, v in vol_profile.items()}
     return hot_zones
+
 def detect_supertrend(df: pd.DataFrame, tf: str) -> Optional[str]:
     if len(df) < 11 or 'supertrend_dir' not in df.columns or pd.isna(df['supertrend_dir'].iloc[-1]):
         return None
@@ -898,6 +933,7 @@ def detect_supertrend(df: pd.DataFrame, tf: str) -> Optional[str]:
     if df['supertrend_dir'].iloc[-1] == -1 and df['supertrend_dir'].iloc[-2] == 1:
         return f"SuperTrend Bearish Flip ({tf})"
     return None
+
 def detect_fvg(df: pd.DataFrame, tf: str, lookback: int = 50, proximity_pct: float = 0.3) -> List[str]:
     if len(df) < 5:
         return []
@@ -920,6 +956,7 @@ def detect_fvg(df: pd.DataFrame, tf: str, lookback: int = 50, proximity_pct: flo
             if dist_pct < proximity_pct:
                 fvgs.append(f"Near Bearish FVG {dist_pct:.1f}% away ({tf})")
     return fvgs
+
 def detect_macd(df: pd.DataFrame, tf: str) -> Optional[str]:
     if len(df) < 2 or 'macd' not in df.columns or 'macd_signal' not in df.columns or pd.isna(df['macd'].iloc[-1]) or pd.isna(df['macd_signal'].iloc[-1]):
         return None
@@ -928,6 +965,7 @@ def detect_macd(df: pd.DataFrame, tf: str) -> Optional[str]:
     if df['macd'].iloc[-1] < df['macd_signal'].iloc[-1] and df['macd'].iloc[-2] >= df['macd_signal'].iloc[-2]:
         return f"Bearish MACD Crossover ({tf})"
     return None
+
 def detect_pre_cross(df: pd.DataFrame, tf: str) -> Optional[str]:
     if len(df) < 2 or tf not in ['4h', '1d'] or 'ema50' not in df.columns or 'ema100' not in df.columns or pd.isna(df['ema50'].iloc[-1]) or pd.isna(df['ema100'].iloc[-1]):
         return None
@@ -936,6 +974,7 @@ def detect_pre_cross(df: pd.DataFrame, tf: str) -> Optional[str]:
     if diff < 0.005:
         return "Golden Cross Incoming" if l['ema50'] > l['ema100'] else "Death Cross Incoming"
     return None
+
 def detect_divergence(df: pd.DataFrame, tf: str) -> Optional[str]:
     if len(df) < 50 or tf not in ['4h', '1d'] or 'rsi' not in df.columns or pd.isna(df['rsi'].iloc[-1]):
         return None
@@ -954,6 +993,7 @@ def detect_divergence(df: pd.DataFrame, tf: str) -> Optional[str]:
     if price.iloc[-1] > price.loc[swing_high_idx] and rsi.iloc[-1] < rsi.loc[swing_high_idx] and rsi.iloc[-1] > 75:
         return f"Bearish RSI Divergence ({tf})"
     return None
+
 def detect_candle_patterns(df: pd.DataFrame, tf: str) -> List[str]:
     if len(df) < 3:
         return []
@@ -963,7 +1003,7 @@ def detect_candle_patterns(df: pd.DataFrame, tf: str) -> List[str]:
     upper = c['high'] - max(c['open'], c['close'])
     lower = min(c['open'], c['close']) - c['low']
     range_size = c['high'] - c['low']
-    if body > 0.7 * range_size and df['volume'].iloc[-1] > 1.2 * df['volume_sma'].iloc[-1]:
+    if body > 0.7 * range_size and df['volume'].iloc[-1] > 1.1 * df['volume_sma'].iloc[-1]:  # RELAXED vol
         dir_str = "Bullish" if c['close'] > c['open'] else "Bearish"
         patterns.add(f"{dir_str} Displacement Candle ({tf})")
     if body > 0 and lower > 2 * body and upper < body * 0.3 and c['close'] > p['close']:
@@ -977,6 +1017,7 @@ def detect_candle_patterns(df: pd.DataFrame, tf: str) -> List[str]:
     if c['high'] < p['high'] and c['low'] > p['low']:
         patterns.add(f"Inside Bar ({tf})")
     return list(patterns)
+
 async def process_trade(trades: Dict[str, Any], to_delete: List[str], now: datetime, current_capital: float, prices: Dict[str, Optional[float]], updated_keys: List[str], is_protected: bool = False):
     for trade_key, trade in list(trades.items()):
         clean_symbol = get_clean_symbol(trade_key)
@@ -1079,25 +1120,25 @@ async def process_trade(trades: Dict[str, Any], to_delete: List[str], now: datet
                 save_stats(stats)
                 to_delete.append(trade_key)
                 updated_keys.append(trade_key)
+
 async def btc_trend_update(context):
     global btc_trend_global
     try:
-        df = await fetch_ohlcv('BTC/USDT', '1d', limit=500) # Zwiększony limit z 300 na 500
+        df = await fetch_ohlcv('BTC/USDT', '1d', limit=500)
         if len(df) == 0:
             logging.warning("Empty raw DF in BTC trend – possible rate limit or insufficient data")
-            btc_trend_global = "Sideways" # fallback
+            btc_trend_global = "Sideways"  # fallback
             return
-        # Compute only necessary for trend (avoid full indicators/dropna causing empty DF)
+        # Compute only necessary for trend
         df = df.copy()
         df['ema50'] = ta.ema(df['close'], 50)
         df['ema100'] = ta.ema(df['close'], 100)
-        # Drop only rows where ema50 and ema100 are NaN
         df = df.dropna(subset=['ema50', 'ema100'])
         if len(df) == 0:
             logging.warning("Empty DF after EMAs in BTC trend – insufficient data")
-            btc_trend_global = "Sideways" # fallback
+            btc_trend_global = "Sideways"
             return
-        if len(df) < 100: # Min bars for reliable EMA100
+        if len(df) < 100:
             logging.warning(f"Insufficient bars ({len(df)}) for trend in BTC – fallback to Sideways")
             btc_trend_global = "Sideways"
             return
@@ -1114,7 +1155,8 @@ async def btc_trend_update(context):
         logging.info(f"Global BTC trend: {btc_trend_global}")
     except Exception as e:
         logging.error(f"BTC trend update error: {e}")
-        btc_trend_global = "Sideways" # safe fallback
+        btc_trend_global = "Sideways"  # safe fallback
+
 async def price_update_callback(context):
     global last_price_update, prices_global
     now = time.time()
@@ -1133,6 +1175,7 @@ async def price_update_callback(context):
     finally:
         exec_time = time.perf_counter() - start
         logging.info(f"Price update cycle completed in {exec_time:.2f}s")
+
 async def track_callback(context):
     global stats, open_trades, protected_trades
     start_time = time.perf_counter()
@@ -1177,6 +1220,7 @@ async def track_callback(context):
     except Exception as e:
         logging.error(f"Track callback error: {e}")
         logging.info(f"Track cycle failed in {time.perf_counter() - start_time:.2f}s")
+
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logging.info(f"/stats triggered by user {update.effective_user.id}")
     try:
@@ -1203,6 +1247,7 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"/stats error: {e}")
         await update.message.reply_text(f"Error fetching stats: {str(e)}", parse_mode='Markdown')
+
 async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logging.info(f"/health triggered by user {update.effective_user.id}")
     try:
@@ -1212,22 +1257,24 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         active = len([t for trades in [open_trades, protected_trades] for t in trades.values() if t.get('active')])
         pending = len([t for t in open_trades.values() if not t.get('active')])
         msg = (
-            "**Grok Elite Bot v24.01.8 - Institutional Hunter Alive!**\n\n"
+            "**Grok Elite Bot v24.02.0 - Daily Hunter Alive!**\n\n"
             f"**Uptime Check:** {uptime}\n"
             f"**Open Trades:** {open_count}\n"
             f"**Protected Trades:** {protected_count}\n"
             f"**Active:** {active} | **Pending:** {pending}\n"
-            f"**Status:** Zero-noise: Str=3 OBs, 24h CD, multi-TF + Order Flow delta (relaxed vol 1.2x, delta 0.5%)"
+            f"**Status:** Daily reversals: str>=2 OBs, liq sweeps, ADX anti-consol, 12h CD"
         )
         await update.message.reply_text(msg, parse_mode='Markdown')
         logging.info(f"/health sent successfully")
     except Exception as e:
         logging.error(f"/health error: {e}")
         await update.message.reply_text(f"Health check failed: {str(e)}", parse_mode='Markdown')
+
 async def recap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logging.info(f"/recap triggered by user {update.effective_user.id}")
     await daily_callback(context)
     await update.message.reply_text("**Manual recap triggered**—check logs/messages!", parse_mode='Markdown')
+
 async def daily_callback(context):
     now = datetime.now(timezone.utc)
     recap_file = RECAP_FILE
@@ -1315,26 +1362,29 @@ async def daily_callback(context):
     except Exception as e:
         logging.error(f"Daily recap error: {type(e).name}: {str(e)}")
         await asyncio.sleep(1)
+
 async def webhook_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
         logging.info(f"Webhook update: user {update.effective_user.id}, command {update.message.text}")
+
+# Update signal_callback: consol check, remove mini-backtest, min triggers=1, +liq
 async def signal_callback(context):
     start_time = time.perf_counter()
-    logging.info("=== Starting elite signal cycle ===")
+    logging.info("=== Starting daily signal cycle ===")
     try:
         if await BanManager.check_and_sleep(skip_long_sleep=True):
             logging.warning("Global ban during signal check (short mode); skipping")
             total_time = time.perf_counter() - start_time
             logging.info(f"=== Signal cycle complete in {total_time:.2f}s ===")
             return
-        if not TELEGRAM_TOKEN: # NEW: Early check for env
+        if not TELEGRAM_TOKEN:
             logging.error("TELEGRAM_TOKEN missing - skipping signal cycle")
             return
         btc_trend = btc_trend_global
         logging.info(f"BTC Trend (global): {btc_trend}")
         now = datetime.now(timezone.utc)
         prices = await fetch_ticker_batch()
-        order_books = await fetch_order_flow_batch() # NEW: Fetch order books
+        order_books = await fetch_order_flow_batch()
         oi_tasks = [fetch_open_interest(s) for s in SYMBOLS]
         oi_results = await asyncio.gather(*oi_tasks, return_exceptions=True)
         oi_data_dict = {SYMBOLS[i]: oi_results[i] if not isinstance(oi_results[i], Exception) else None for i in range(len(SYMBOLS))}
@@ -1357,41 +1407,19 @@ async def signal_callback(context):
                 sym_time = time.perf_counter() - sym_start
                 logging.info(f"Finished {symbol} in {sym_time:.2f}s")
                 continue
+            # NEW v24.02.0: Consol check on 1d first
+            df_1d = await fetch_ohlcv(symbol, '1d')
+            if is_consolidation(df_1d):
+                logging.info(f"Skipped {symbol}: Daily consolidation")
+                sym_time = time.perf_counter() - sym_start
+                logging.info(f"Finished {symbol} in {sym_time:.2f}s")
+                continue
             oi_data = oi_data_dict.get(symbol)
-            whale_data = {'boost': 0, 'reason': ''}
-            if symbol != 'BTC/USDT':
-                threshold = 200 if 'ETH' in symbol else 2000
-                try:
-                    since = exchange.milliseconds() - 7 * 24 * 60 * 60 * 1000
-                    trades = await exchange.fetch_trades(symbol, since=since, limit=1000)
-                    inflows = [t for t in trades if t['side'] == 'buy' and t['amount'] > threshold]
-                    count = len(inflows)
-                    if count >= 5:
-                        total = sum(t['amount'] for t in inflows)
-                        avg = total / count
-                        if avg > 2 * threshold:
-                            whale_data = {'boost':2, 'reason':f"+Inst Whale Alt (avg {avg:.1f}, {count} tx)"}
-                            logging.info(f"Inst whale boost for {symbol}: avg {avg:.1f}, count {count}")
-                except Exception as e:
-                    logging.error(f"CCXT whale error for {symbol}: {e}")
-            if symbol == 'BTC/USDT':
-                try:
-                    since = exchange.milliseconds() - 7 * 24 * 60 * 60 * 1000
-                    trades = await exchange.fetch_trades(symbol, since=since, limit=1000)
-                    inflows = [t for t in trades if t['side'] == 'buy' and t['amount'] > 20]
-                    count = len(inflows)
-                    if count >= 5:
-                        total = sum(t['amount'] for t in inflows)
-                        avg = total / count
-                        if avg > 40:
-                            whale_data = {'boost':2, 'reason': f"+Inst Whale (avg {avg:.1f} BTC, {count} tx)"}
-                            logging.info(f"Inst whale boost for {symbol}: avg {avg:.1f}, count {count}")
-                except Exception as e:
-                    logging.error(f"CCXT whale error for {symbol}: {e}")
+            whale_data = {'boost': 0, 'reason': ''}  # Retained, but simplified - no fetch
             data = {}
             for tf in TIMEFRAMES:
                 df_tf = await fetch_ohlcv(symbol, tf)
-                book = order_books.get(symbol) # NEW: Pass book to indicators
+                book = order_books.get(symbol)
                 data[tf] = add_indicators(df_tf, book) if len(df_tf) > 0 else pd.DataFrame()
                 await asyncio.sleep(0.5)
             trend = None
@@ -1418,7 +1446,7 @@ async def signal_callback(context):
                         else:
                             trend = "Sideways"
                 else:
-                    trend = "Sideways" # Fallback neutral
+                    trend = "Sideways"  # Fallback neutral
             triggers = set()
             is_alt = symbol != 'BTC/USDT'
             for tf in TIMEFRAMES:
@@ -1433,42 +1461,43 @@ async def signal_callback(context):
                 triggers.update(normalized_fvgs)
                 candles = detect_candle_patterns(df, tf)
                 triggers.update(candles)
-                if len(df) > 20 and 'volume_sma' in df.columns and not pd.isna(df['volume_sma'].iloc[-1]) and df['volume'].iloc[-1] > 1.2 * df['volume_sma'].iloc[-1]:
+                if len(df) > 20 and 'volume_sma' in df.columns and not pd.isna(df['volume_sma'].iloc[-1]) and df['volume'].iloc[-1] > 1.1 * df['volume_sma'].iloc[-1]:  # RELAXED
                     triggers.add(f"Inst Vol Surge ({tf})")
                 obs = await find_unmitigated_order_blocks(df, tf=tf, symbol=symbol)
                 raw_obs = len(obs.get('bullish', []) + obs.get('bearish', []))
                 logging.info(f"Raw OBs for {symbol} {tf}: {raw_obs} (before elite filter)")
                 for ob_type in ['bullish', 'bearish']:
                     for ob in obs.get(ob_type, []):
-                        if ob['strength'] != 3:
+                        if ob['strength'] < 2:  # RELAXED: >=2
                             continue
                         mid = (ob['low'] + ob['high']) / 2
                         dist_pct = abs(price - mid) / price * 100
                         if dist_pct < 0.5:
-                            # Retained: Bidirectional triggers
                             dir_str = "Bullish Long" if ob_type == 'bullish' else "Bearish Short"
-                            triggers.add(f"Elite {dir_str} OB str3 {dist_pct:.1f}% away ({tf})")
-                # NEW Order Flow: Add delta trigger if |delta| >0.5%
+                            triggers.add(f"Elite {dir_str} OB str{ob['strength']} {dist_pct:.1f}% away ({tf})")
+                # Order Flow: delta trigger |delta| >0.5%
                 delta = df['order_delta'].iloc[-1] if 'order_delta' in df.columns else 0
                 if abs(delta) > 0.5:
                     dir_str = "Bullish" if delta > 0 else "Bearish"
                     triggers.add(f"Order Flow {dir_str} Delta {delta:.1f}% ({tf})")
+                # NEW: Liq sweep trigger
+                if df['liq_sweep'].iloc[-1]:
+                    triggers.add(f"Liq Sweep Bounce ({tf})")
             logging.info(f"All triggers for {symbol}: {list(triggers)}")
-            # Retained: Add 'Bearish Short' to strong keywords for symmetry
-            strong_triggers = [t for t in triggers if any(kw in t for kw in ['OB str3', 'Displacement', 'Inst Vol', 'Exhaust', 'Bearish Short', 'Order Flow'])] # NEW: + Order Flow
-            logging.info(f"Elite triggers for {symbol}: {len(strong_triggers)} (min 1 req)") # RELAXED: from min 3 to min 2
-            if len(strong_triggers) < 1: # RELAXED: from <3 to <2
+            strong_triggers = [t for t in triggers if any(kw in t for kw in ['OB str', 'Displacement', 'Inst Vol', 'Exhaust', 'Bearish Short', 'Liq Sweep', 'Order Flow'])]  # NEW: + Liq Sweep
+            logging.info(f"Elite triggers for {symbol}: {len(strong_triggers)} (min 1 req)")
+            if len(strong_triggers) < 1:
                 sym_time = time.perf_counter() - sym_start
                 logging.info(f"Skipped {symbol}: <1 elite triggers")
                 logging.info(f"Finished {symbol} in {sym_time:.2f}s")
                 continue
             premium_zones = []
-            for tf in ['1d', '1w']:
+            for tf in ['1d', '1w']:  # Focus daily
                 if tf not in data:
                     continue
                 tf_df = data[tf]
                 if len(tf_df) > 0:
-                    book = order_books.get(symbol) # NEW: Pass to zones
+                    book = order_books.get(symbol)
                     tf_zones = await find_next_premium_zones(tf_df, price, tf, symbol, oi_data, trend=trend, whale_data=whale_data, order_book=book)
                     premium_zones.extend(tf_zones)
             logging.info(f"Total elite {len(premium_zones)} premium zones for {symbol} before Grok")
@@ -1477,276 +1506,259 @@ async def signal_callback(context):
                 logging.info(f"Skipped {symbol}: No elite zones")
                 logging.info(f"Finished {symbol} in {sym_time:.2f}s")
                 continue
-            async def mini_backtest_zone(zone: Dict, df_14d: pd.DataFrame) -> float:
-                hits = 0
-                total = 0
-                for _, row in df_14d.iterrows():
-                    if zone['direction'] == 'Long' and max(zone['zone_low'], row['low']) <= min(zone['zone_high'], row['high']):
-                        hits += 1
-                    elif zone['direction'] == 'Short' and max(zone['zone_low'], row['low']) <= min(zone['zone_high'], row['high']):
-                        hits += 1
-                    total += 1
-                return hits / total * 100 if total > 0 else 0
-            df_14d = await fetch_ohlcv(symbol, '1h', since=int((datetime.now(timezone.utc)-timedelta(days=14)).timestamp()*1000))
-            for z in premium_zones:
-                bt_win = await mini_backtest_zone(z, df_14d)
-                if bt_win < 60:
-                    z['prob'] -= 15
-                    logging.info(f"Mini-backtest adjusted {symbol} {z['direction']} prob to {z['prob']}% (bt_win {bt_win:.1f}%)")
-                if z['prob'] < 90:
-                    premium_zones = [zz for zz in premium_zones if zz != z]
-            if premium_zones:
-                grok_potential = await query_grok_potential(premium_zones, symbol, price, trend, btc_trend)
-                retry_count = 0
-                max_retries = 2
-                while retry_count < max_retries:
-                    has_roadmap = 'roadmap' in grok_potential and grok_potential.get('roadmap')
-                    if not has_roadmap and premium_zones:
-                        logging.info(f"No roadmap on attempt {retry_count+1} for {symbol}; forcing retry...")
-                        grok_potential = await query_grok_potential(premium_zones, symbol, price, trend, btc_trend)
-                        retry_count += 1
-                        continue
-                    break
-                live_trade_key = 'live_trade' if 'live_trade' in grok_potential else None
-                if live_trade_key and not grok_potential.get('no_live_trade', True):
-                    grok = grok_potential[live_trade_key]
-                    logging.info(f"Grok elite live trade for {symbol}: {grok}")
-                    if grok.get('strength', 0) != 3 or grok.get('confidence', 0) < 90:
-                        logging.info(f"Skipped non-elite live {symbol}: str {grok.get('strength', 0)} or conf {grok.get('confidence', 0)}")
-                        sym_time = time.perf_counter() - sym_start
-                        logging.info(f"Finished {symbol} in {sym_time:.2f}s")
-                        continue
-                    required_keys = ['direction', 'entry_low', 'entry_high', 'sl', 'tp1', 'tp2', 'leverage', 'confidence', 'reason']
-                    if not all(key in grok for key in required_keys):
-                        logging.warning(f"Invalid Grok response for {symbol}: {grok}")
-                        await asyncio.sleep(2)
-                        sym_time = time.perf_counter() - sym_start
-                        logging.info(f"Finished {symbol} in {sym_time:.2f}s")
-                        continue
-                    entry_low = min(grok['entry_low'], grok['entry_high'])
-                    entry_high = max(grok['entry_low'], grok['entry_high'])
-                    new_conf = grok['confidence']
-                    leverage = min(grok['leverage'], 5)
-                    overlapping = []
-                    for trades_dict, dict_name in [(open_trades, 'open'), (protected_trades, 'protected')]:
-                        for key, t in trades_dict.items():
-                            overlap_ratio = zones_overlap(entry_low, entry_high, t['entry_low'], t['entry_high'])
-                            if overlap_ratio > 0:
-                                overlapping.append((key, t, dict_name, overlap_ratio))
-                    if overlapping:
-                        same_dir_overlaps = [o for o in overlapping if o[1]['direction'] == grok['direction']]
-                        if same_dir_overlaps:
-                            max_conf = max(new_conf, max(o[1]['confidence'] for o in same_dir_overlaps))
-                            min_sl = min(grok['sl'], min(o[1]['sl'] for o in same_dir_overlaps))
-                            max_tp = max(grok['tp2'], max(o[1]['tp2'] for o in same_dir_overlaps))
-                            for key, t, dict_name, ratio in same_dir_overlaps:
-                                if t.get('active') and dict_name == 'open':
-                                    protected_trades[key] = open_trades.pop(key)
-                                    save_trades(open_trades)
-                                    save_protected(protected_trades)
-                                    logging.info(f"Protected active overlap for {key}")
-                            merge_key, merge_t, _, _ = same_dir_overlaps[0]
-                            merge_t['confidence'] = max_conf
-                            merge_t['sl'] = min_sl
-                            merge_t['tp2'] = max_tp
-                            if new_conf > merge_t['confidence']:
-                                merge_t['entry_low'] = entry_low
-                                merge_t['entry_high'] = entry_high
-                            logging.info(f"Merged elite live signal for {symbol}: conf {max_conf}")
-                            for key, t, dict_name, ratio in same_dir_overlaps[1:]:
-                                if ratio >= 0.95:
-                                    if dict_name == 'open':
-                                        del open_trades[key]
-                                    else:
-                                        del protected_trades[key]
-                                    logging.info(f"Removed high-overlap {key} (ratio {ratio:.2f})")
+            # Removed mini-backtest v24.02.0
+            grok_potential = await query_grok_potential(premium_zones, symbol, price, trend, btc_trend)
+            retry_count = 0
+            max_retries = 2
+            while retry_count < max_retries:
+                has_roadmap = 'roadmap' in grok_potential and grok_potential.get('roadmap')
+                if not has_roadmap and premium_zones:
+                    logging.info(f"No roadmap on attempt {retry_count+1} for {symbol}; forcing retry...")
+                    grok_potential = await query_grok_potential(premium_zones, symbol, price, trend, btc_trend)
+                    retry_count += 1
+                    continue
+                break
+            live_trade_key = 'live_trade' if 'live_trade' in grok_potential else None
+            if live_trade_key and not grok_potential.get('no_live_trade', True):
+                grok = grok_potential[live_trade_key]
+                logging.info(f"Grok elite live trade for {symbol}: {grok}")
+                if grok.get('strength', 0) < 2 or grok.get('confidence', 0) < 70:  # RELAXED
+                    logging.info(f"Skipped non-elite live {symbol}: str {grok.get('strength', 0)} or conf {grok.get('confidence', 0)}")
+                    sym_time = time.perf_counter() - sym_start
+                    logging.info(f"Finished {symbol} in {sym_time:.2f}s")
+                    continue
+                required_keys = ['direction', 'entry_low', 'entry_high', 'sl', 'tp1', 'tp2', 'leverage', 'confidence', 'reason']
+                if not all(key in grok for key in required_keys):
+                    logging.warning(f"Invalid Grok response for {symbol}: {grok}")
+                    await asyncio.sleep(2)
+                    sym_time = time.perf_counter() - sym_start
+                    logging.info(f"Finished {symbol} in {sym_time:.2f}s")
+                    continue
+                entry_low = min(grok['entry_low'], grok['entry_high'])
+                entry_high = max(grok['entry_low'], grok['entry_high'])
+                new_conf = grok['confidence']
+                leverage = min(grok['leverage'], 5)
+                overlapping = []
+                for trades_dict, dict_name in [(open_trades, 'open'), (protected_trades, 'protected')]:
+                    for key, t in trades_dict.items():
+                        overlap_ratio = zones_overlap(entry_low, entry_high, t['entry_low'], t['entry_high'])
+                        if overlap_ratio > 0:
+                            overlapping.append((key, t, dict_name, overlap_ratio))
+                if overlapping:
+                    same_dir_overlaps = [o for o in overlapping if o[1]['direction'] == grok['direction']]
+                    if same_dir_overlaps:
+                        max_conf = max(new_conf, max(o[1]['confidence'] for o in same_dir_overlaps))
+                        min_sl = min(grok['sl'], min(o[1]['sl'] for o in same_dir_overlaps))
+                        max_tp = max(grok['tp2'], max(o[1]['tp2'] for o in same_dir_overlaps))
+                        for key, t, dict_name, ratio in same_dir_overlaps:
+                            if t.get('active') and dict_name == 'open':
+                                protected_trades[key] = open_trades.pop(key)
+                                save_trades(open_trades)
+                                save_protected(protected_trades)
+                                logging.info(f"Protected active overlap for {key}")
+                        merge_key, merge_t, _, _ = same_dir_overlaps[0]
+                        merge_t['confidence'] = max_conf
+                        merge_t['sl'] = min_sl
+                        merge_t['tp2'] = max_tp
+                        if new_conf > merge_t['confidence']:
+                            merge_t['entry_low'] = entry_low
+                            merge_t['entry_high'] = entry_high
+                        logging.info(f"Merged elite live signal for {symbol}: conf {max_conf}")
+                        for key, t, dict_name, ratio in same_dir_overlaps[1:]:
+                            if ratio >= 0.95:
+                                if dict_name == 'open':
+                                    del open_trades[key]
+                                else:
+                                    del protected_trades[key]
+                                logging.info(f"Removed high-overlap {key} (ratio {ratio:.2f})")
+                        save_trades(open_trades)
+                        save_protected(protected_trades)
+                        last_signal_time[symbol] = now
+                    else:
+                        max_overlap = max(r for _, _, _, r in overlapping)
+                        if max_overlap < 0.95:
+                            trade_key = symbol
+                            open_trades[trade_key] = {
+                                'direction': grok['direction'],
+                                'entry_low': entry_low,
+                                'entry_high': entry_high,
+                                'sl': grok['sl'],
+                                'tp1': grok['tp1'],
+                                'tp2': grok['tp2'],
+                                'leverage': leverage,
+                                'confidence': new_conf,
+                                'active': False,
+                                'last_check': datetime.now(timezone.utc),
+                                'processed': False,
+                                'strength': grok.get('strength', 2)  # RELAXED
+                            }
                             save_trades(open_trades)
-                            save_protected(protected_trades)
                             last_signal_time[symbol] = now
                         else:
-                            max_overlap = max(r for _, _, _, r in overlapping)
-                            if max_overlap < 0.95:
-                                trade_key = symbol
-                                open_trades[trade_key] = {
-                                    'direction': grok['direction'],
+                            logging.info(f"Skipped live {symbol}: high overlap diff dir {max_overlap:.2f}")
+                            sym_time = time.perf_counter() - sym_start
+                            logging.info(f"Finished {symbol} in {sym_time:.2f}s")
+                            continue
+                else:
+                    trade_key = symbol
+                    open_trades[trade_key] = {
+                        'direction': grok['direction'],
+                        'entry_low': entry_low,
+                        'entry_high': entry_high,
+                        'sl': grok['sl'],
+                        'tp1': grok['tp1'],
+                        'tp2': grok['tp2'],
+                        'leverage': leverage,
+                        'confidence': new_conf,
+                        'active': False,
+                        'last_check': datetime.now(timezone.utc),
+                        'processed': False,
+                        'strength': grok.get('strength', 2)
+                    }
+                    save_trades(open_trades)
+                    last_signal_time[symbol] = now
+                entry_mid = (entry_low + entry_high) / 2
+                rr1 = abs(grok['tp1'] - entry_mid) / abs(grok['sl'] - entry_mid)
+                rr2 = abs(grok['tp2'] - entry_mid) / abs(grok['sl'] - entry_mid)
+                dist_to_sl = abs(entry_mid - grok['sl']) / entry_mid * 100
+                msg = (
+                    f"**{symbol.replace('/USDT','')} ELITE LIVE SIGNAL (Inst OB Hit!)**\n\n"
+                    f"*Price:* {format_price(price)} | *Trend:* {trend}"
+                )
+                if is_alt and btc_trend: msg += f" | *BTC:* {btc_trend}"
+                msg += "\n\n"
+                msg += (
+                    f"{grok['direction']} | **{new_conf}%**\n"
+                    f"*Entry Zone:* {format_price(entry_low)}–{format_price(entry_high)}\n"
+                    f"*SL:* {format_price(grok['sl'])} | *TP1* {format_price(grok['tp1'])} | *TP2* {format_price(grok['tp2'])}\n"
+                    f"*Leverage:* {leverage}x | *R:R* 1:{rr1:.1f} / 1:{rr2:.1f} | *Risk* {dist_to_sl:.2f}%\n"
+                    f"**Reason:** {grok['reason']}"
+                )
+                logging.info(f"Sending elite live for {symbol}")
+                await bot.send_message(CHAT_ID, msg, parse_mode='Markdown')
+            else:
+                sent_roadmap = False
+                if 'roadmap' in grok_potential and grok_potential['roadmap']:
+                    conservative_msg = f"**{symbol.replace('/USDT','')} ELITE ROADMAP** | *Price:* {format_price(price)} | *Trend:* {trend}"
+                    if is_alt and btc_trend: conservative_msg += f" | *BTC:* {btc_trend}"
+                    conservative_msg += "\n\nElite inst zones (70%+ conf, str>=2):\n"  # RELAXED
+                    roadmap_count = 0
+                    for i, z in enumerate(grok_potential['roadmap'], 1):
+                        if z['confidence'] > 70 and z['dist_pct'] < 7 and z.get('strength', 0) >= 2:  # RELAXED v24.02.0
+                            roadmap_count += 1
+                            entry_low = min(z['entry_low'], z['entry_high'])
+                            entry_high = max(z['entry_low'], z['entry_high'])
+                            new_conf = z['confidence']
+                            leverage = min(z['leverage'], 5)
+                            unique_key = f"{symbol}roadmap{i}"
+                            overlapping = []
+                            for trades_dict, dict_name in [(open_trades, 'open'), (protected_trades, 'protected')]:
+                                for key, t in trades_dict.items():
+                                    overlap_ratio = zones_overlap(entry_low, entry_high, t['entry_low'], t['entry_high'])
+                                    if overlap_ratio > 0:
+                                        overlapping.append((key, t, dict_name, overlap_ratio))
+                            if overlapping:
+                                same_dir_overlaps = [o for o in overlapping if o[1]['direction'] == z['direction']]
+                                if same_dir_overlaps:
+                                    max_conf = max(new_conf, max(o[1]['confidence'] for o in same_dir_overlaps))
+                                    min_sl = min(z['sl'], min(o[1]['sl'] for o in same_dir_overlaps))
+                                    max_tp = max(z['tp2'], max(o[1]['tp2'] for o in same_dir_overlaps))
+                                    for key, t, dict_name, ratio in same_dir_overlaps:
+                                        if t.get('active') and dict_name == 'open':
+                                            protected_trades[key] = open_trades.pop(key)
+                                            save_trades(open_trades)
+                                            save_protected(protected_trades)
+                                    merge_key, merge_t, _, _ = same_dir_overlaps[0]
+                                    merge_t['confidence'] = max_conf
+                                    merge_t['sl'] = min_sl
+                                    merge_t['tp2'] = max_tp
+                                    if new_conf > merge_t['confidence']:
+                                        merge_t['entry_low'] = entry_low
+                                        merge_t['entry_high'] = entry_high
+                                    logging.info(f"Merged elite roadmap for {symbol}: conf {max_conf}")
+                                    for key, t, dict_name, ratio in same_dir_overlaps[1:]:
+                                        if ratio >= 0.95:
+                                            if dict_name == 'open':
+                                                del open_trades[key]
+                                            else:
+                                                del protected_trades[key]
+                                    save_trades(open_trades)
+                                    save_protected(protected_trades)
+                                    last_signal_time[symbol] = now
+                                else:
+                                    max_overlap = max(r for _, _, _, r in overlapping)
+                                    if max_overlap < 0.95:
+                                        open_trades[unique_key] = {
+                                            'direction': z['direction'],
+                                            'entry_low': entry_low,
+                                            'entry_high': entry_high,
+                                            'sl': z['sl'],
+                                            'tp1': z['tp1'],
+                                            'tp2': z['tp2'],
+                                            'leverage': leverage,
+                                            'confidence': new_conf,
+                                            'type': 'roadmap',
+                                            'active': False,
+                                            'last_check': datetime.now(timezone.utc),
+                                            'dist_pct': z['dist_pct'],
+                                            'processed': False,
+                                            'strength': z['strength']
+                                        }
+                                        save_trades(open_trades)
+                                        last_signal_time[symbol] = now
+                                        logging.info(f"Added elite roadmap trade for {symbol}: {z['direction']} {new_conf}% str{z['strength']}")
+                                    else:
+                                        logging.info(f"Skipped elite roadmap {symbol}: high overlap diff dir {max_overlap:.2f}")
+                                        continue
+                            else:
+                                open_trades[unique_key] = {
+                                    'direction': z['direction'],
                                     'entry_low': entry_low,
                                     'entry_high': entry_high,
-                                    'sl': grok['sl'],
-                                    'tp1': grok['tp1'],
-                                    'tp2': grok['tp2'],
+                                    'sl': z['sl'],
+                                    'tp1': z['tp1'],
+                                    'tp2': z['tp2'],
                                     'leverage': leverage,
                                     'confidence': new_conf,
+                                    'type': 'roadmap',
                                     'active': False,
                                     'last_check': datetime.now(timezone.utc),
+                                    'dist_pct': z['dist_pct'],
                                     'processed': False,
-                                    'strength': grok.get('strength', 3)
+                                    'strength': z['strength']
                                 }
                                 save_trades(open_trades)
                                 last_signal_time[symbol] = now
-                            else:
-                                logging.info(f"Skipped live {symbol}: high overlap diff dir {max_overlap:.2f}")
-                                sym_time = time.perf_counter() - sym_start
-                                logging.info(f"Finished {symbol} in {sym_time:.2f}s")
-                                continue
-                    else:
-                        trade_key = symbol
-                        open_trades[trade_key] = {
-                            'direction': grok['direction'],
-                            'entry_low': entry_low,
-                            'entry_high': entry_high,
-                            'sl': grok['sl'],
-                            'tp1': grok['tp1'],
-                            'tp2': grok['tp2'],
-                            'leverage': leverage,
-                            'confidence': new_conf,
-                            'active': False,
-                            'last_check': datetime.now(timezone.utc),
-                            'processed': False,
-                            'strength': grok.get('strength', 3)
-                        }
-                        save_trades(open_trades)
-                        last_signal_time[symbol] = now
-                    entry_mid = (entry_low + entry_high) / 2
-                    rr1 = abs(grok['tp1'] - entry_mid) / abs(grok['sl'] - entry_mid)
-                    rr2 = abs(grok['tp2'] - entry_mid) / abs(grok['sl'] - entry_mid)
-                    dist_to_sl = abs(entry_mid - grok['sl']) / entry_mid * 100
-                    msg = (
-                        f"**{symbol.replace('/USDT','')} ELITE LIVE SIGNAL (Inst OB Hit!)**\n\n"
-                        f"*Price:* {format_price(price)} | *Trend:* {trend}"
-                    )
-                    if is_alt and btc_trend: msg += f" | *BTC:* {btc_trend}"
-                    msg += "\n\n"
-                    msg += (
-                        f"{grok['direction']} | **{new_conf}%**\n"
-                        f"*Entry Zone:* {format_price(entry_low)}–{format_price(entry_high)}\n"
-                        f"*SL:* {format_price(grok['sl'])} | *TP1* {format_price(grok['tp1'])} | *TP2* {format_price(grok['tp2'])}\n"
-                        f"*Leverage:* {leverage}x | *R:R* 1:{rr1:.1f} / 1:{rr2:.1f} | *Risk* {dist_to_sl:.2f}%\n"
-                        f"**Reason:** {grok['reason']}"
-                    )
-                    logging.info(f"Sending elite live for {symbol}")
-                    await bot.send_message(CHAT_ID, msg, parse_mode='Markdown')
-                else:
-                    sent_roadmap = False
-                    if 'roadmap' in grok_potential and grok_potential['roadmap']:
-                        conservative_msg = f"**{symbol.replace('/USDT','')} ELITE ROADMAP** | *Price:* {format_price(price)} | *Trend:* {trend}"
-                        if is_alt and btc_trend: conservative_msg += f" | *BTC:* {btc_trend}"
-                        conservative_msg += "\n\nElite inst zones (80%+ conf, str=3):\n" # RELAXED: from 90% to 80%
-                        roadmap_count = 0
-                        for i, z in enumerate(grok_potential['roadmap'], 1):
-                            if z['confidence'] > 80 and z['dist_pct'] < 6 and z.get('strength', 0) == 3: # RELAXED: conf>80 from 90, dist<6 from 5
-                                roadmap_count += 1
-                                entry_low = min(z['entry_low'], z['entry_high'])
-                                entry_high = max(z['entry_low'], z['entry_high'])
-                                new_conf = z['confidence']
-                                leverage = min(z['leverage'], 5)
-                                unique_key = f"{symbol}roadmap{i}"
-                                overlapping = []
-                                for trades_dict, dict_name in [(open_trades, 'open'), (protected_trades, 'protected')]:
-                                    for key, t in trades_dict.items():
-                                        overlap_ratio = zones_overlap(entry_low, entry_high, t['entry_low'], t['entry_high'])
-                                        if overlap_ratio > 0:
-                                            overlapping.append((key, t, dict_name, overlap_ratio))
-                                if overlapping:
-                                    same_dir_overlaps = [o for o in overlapping if o[1]['direction'] == z['direction']]
-                                    if same_dir_overlaps:
-                                        max_conf = max(new_conf, max(o[1]['confidence'] for o in same_dir_overlaps))
-                                        min_sl = min(z['sl'], min(o[1]['sl'] for o in same_dir_overlaps))
-                                        max_tp = max(z['tp2'], max(o[1]['tp2'] for o in same_dir_overlaps))
-                                        for key, t, dict_name, ratio in same_dir_overlaps:
-                                            if t.get('active') and dict_name == 'open':
-                                                protected_trades[key] = open_trades.pop(key)
-                                                save_trades(open_trades)
-                                                save_protected(protected_trades)
-                                        merge_key, merge_t, _, _ = same_dir_overlaps[0]
-                                        merge_t['confidence'] = max_conf
-                                        merge_t['sl'] = min_sl
-                                        merge_t['tp2'] = max_tp
-                                        if new_conf > merge_t['confidence']:
-                                            merge_t['entry_low'] = entry_low
-                                            merge_t['entry_high'] = entry_high
-                                        logging.info(f"Merged elite roadmap for {symbol}: conf {max_conf}")
-                                        for key, t, dict_name, ratio in same_dir_overlaps[1:]:
-                                            if ratio >= 0.95:
-                                                if dict_name == 'open':
-                                                    del open_trades[key]
-                                                else:
-                                                    del protected_trades[key]
-                                        save_trades(open_trades)
-                                        save_protected(protected_trades)
-                                        last_signal_time[symbol] = now
-                                    else:
-                                        max_overlap = max(r for _, _, _, r in overlapping)
-                                        if max_overlap < 0.95:
-                                            open_trades[unique_key] = {
-                                                'direction': z['direction'],
-                                                'entry_low': entry_low,
-                                                'entry_high': entry_high,
-                                                'sl': z['sl'],
-                                                'tp1': z['tp1'],
-                                                'tp2': z['tp2'],
-                                                'leverage': leverage,
-                                                'confidence': new_conf,
-                                                'type': 'roadmap',
-                                                'active': False,
-                                                'last_check': datetime.now(timezone.utc),
-                                                'dist_pct': z['dist_pct'],
-                                                'processed': False,
-                                                'strength': z['strength']
-                                            }
-                                            save_trades(open_trades)
-                                            last_signal_time[symbol] = now
-                                            logging.info(f"Added elite roadmap trade for {symbol}: {z['direction']} {new_conf}% str3")
-                                        else:
-                                            logging.info(f"Skipped elite roadmap {symbol}: high overlap diff dir {max_overlap:.2f}")
-                                            continue
-                                else:
-                                    open_trades[unique_key] = {
-                                        'direction': z['direction'],
-                                        'entry_low': entry_low,
-                                        'entry_high': entry_high,
-                                        'sl': z['sl'],
-                                        'tp1': z['tp1'],
-                                        'tp2': z['tp2'],
-                                        'leverage': leverage,
-                                        'confidence': new_conf,
-                                        'type': 'roadmap',
-                                        'active': False,
-                                        'last_check': datetime.now(timezone.utc),
-                                        'dist_pct': z['dist_pct'],
-                                        'processed': False,
-                                        'strength': z['strength']
-                                    }
-                                    save_trades(open_trades)
-                                    last_signal_time[symbol] = now
-                                    logging.info(f"Added elite roadmap trade for {symbol}: {z['direction']} {new_conf}% str3")
-                                entry_mid = (z['entry_low'] + z['entry_high']) / 2
-                                rr = abs(z['tp2'] - entry_mid) / abs(z['sl'] - entry_mid)
-                                conservative_msg += f"{i}. {z['direction']} **{z['confidence']}**\n"
-                                conservative_msg += f"*Zone:* {format_price(z['entry_low'])}–{format_price(z['entry_high'])} | *SL:* {format_price(z['sl'])}\n"
-                                conservative_msg += f"*TP1:* {format_price(z['tp1'])} | *TP2:* {format_price(z['tp2'])} | {min(z['leverage'], 5)}x | *R:R* 1:{rr:.1f}\n"
-                                conservative_msg += f"**Reason:** {z['reason']} ( {z['dist_pct']:.1f}% away, str3 )\n\n"
-                        if roadmap_count > 0:
-                            logging.info(f"Sending elite roadmap for {symbol}")
-                            await bot.send_message(CHAT_ID, conservative_msg, parse_mode='Markdown')
-                            last_signal_time[symbol] = now
-                            sent_roadmap = True
-                    if not sent_roadmap and len(strong_triggers) >= 1: # RELAXED: from >=4 to >=2
-                        trigger_msg = f"**{symbol.replace('/USDT','')} - Elite Triggers** | *Price:* {format_price(price)} | *Trend:* {trend}"
-                        if is_alt and btc_trend: trigger_msg += f" | *BTC:* {btc_trend}"
-                        trigger_msg += "\n\n__Inst signals:__\n" + '\n'.join([f"• {t}" for t in sorted(strong_triggers[:6])])
-                        logging.info(f"Sending elite triggers for {symbol}: {len(strong_triggers)}")
-                        await bot.send_message(CHAT_ID, trigger_msg, parse_mode='Markdown')
+                                logging.info(f"Added elite roadmap trade for {symbol}: {z['direction']} {new_conf}% str{z['strength']}")
+                            entry_mid = (z['entry_low'] + z['entry_high']) / 2
+                            rr = abs(z['tp2'] - entry_mid) / abs(z['sl'] - entry_mid)
+                            conservative_msg += f"{i}. {z['direction']} **{z['confidence']}**\n"
+                            conservative_msg += f"*Zone:* {format_price(z['entry_low'])}–{format_price(z['entry_high'])} | *SL:* {format_price(z['sl'])}\n"
+                            conservative_msg += f"*TP1:* {format_price(z['tp1'])} | *TP2:* {format_price(z['tp2'])} | {min(z['leverage'], 5)}x | *R:R* 1:{rr:.1f}\n"
+                            conservative_msg += f"**Reason:** {z['reason']} ( {z['dist_pct']:.1f}% away, str{z['strength']} )\n\n"
+                    if roadmap_count > 0:
+                        logging.info(f"Sending elite roadmap for {symbol}")
+                        await bot.send_message(CHAT_ID, conservative_msg, parse_mode='Markdown')
                         last_signal_time[symbol] = now
                         sent_roadmap = True
+                if not sent_roadmap and len(strong_triggers) >= 1:
+                    trigger_msg = f"**{symbol.replace('/USDT','')} - Elite Triggers** | *Price:* {format_price(price)} | *Trend:* {trend}"
+                    if is_alt and btc_trend: trigger_msg += f" | *BTC:* {btc_trend}"
+                    trigger_msg += "\n\n__Inst signals:__\n" + '\n'.join([f"• {t}" for t in sorted(strong_triggers[:6])])
+                    logging.info(f"Sending elite triggers for {symbol}: {len(strong_triggers)}")
+                    await bot.send_message(CHAT_ID, trigger_msg, parse_mode='Markdown')
+                    last_signal_time[symbol] = now
+                    sent_roadmap = True
             sym_time = time.perf_counter() - sym_start
             logging.info(f"Finished {symbol} in {sym_time:.2f}s")
             await asyncio.sleep(2)
         total_time = time.perf_counter() - start_time
-        logging.info(f"=== Elite signal cycle complete in {total_time:.2f}s ===")
+        logging.info(f"=== Daily signal cycle complete in {total_time:.2f}s ===")
     except Exception as e:
         logging.error(f"Signal callback error: {e}")
         total_time = time.perf_counter() - start_time
         logging.info(f"=== Signal cycle complete in {total_time:.2f}s (error) ===")
+
 async def post_init(application: Application) -> None:
     logging.info("Starting post_init: Sending welcome and setting webhook...")
     try:
@@ -1774,14 +1786,15 @@ async def post_init(application: Application) -> None:
     logging.info("Webhook set successfully. Jobs will now run.")
     asyncio.create_task(price_background_task())
     logging.info("Background Polling Task started – fresh prices + order flow every 10s!")
-    logging.info("Post_init complete – Elite signals via job in ~60s.")
+    logging.info("Post_init complete – Daily signals via job in ~60s.")
+
 def main():
-    # NEW: Env debug logs
+    # Env debug logs
     logging.info(f"Loaded env: TOKEN={TELEGRAM_TOKEN[:5] if TELEGRAM_TOKEN else 'MISSING'}..., CHAT={CHAT_ID if CHAT_ID else 'MISSING'}, KEY={XAI_API_KEY[:5] if XAI_API_KEY else 'MISSING'}...")
     if not all([TELEGRAM_TOKEN, CHAT_ID, XAI_API_KEY]):
         logging.error("Missing required env vars: TELEGRAM_TOKEN, CHAT_ID, XAI_API_KEY")
-        sys.exit(1) # NEW: Explicit exit
-    logging.info(f"Elite cooldown: {COOLDOWN_HOURS}h | Inst OB only, zero noise + Order Flow delta")
+        sys.exit(1)
+    logging.info(f"Daily cooldown: {COOLDOWN_HOURS}h | OB str>=2, liq sweeps, anti-consol")
     application = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     application.add_handler(CommandHandler("stats", stats_cmd))
     application.add_handler(CommandHandler("health", health_cmd))
@@ -1794,7 +1807,7 @@ def main():
         first=60,
         job_kwargs={'max_instances': 2, 'misfire_grace_time': 30}
     )
-    logging.info(f"Elite signal job: first in 60s, max_instances=2")
+    logging.info(f"Daily signal job: first in 60s, max_instances=2")
     track_job = application.job_queue.run_repeating(
         track_callback,
         interval=TRACK_INTERVAL,
@@ -1840,5 +1853,6 @@ def main():
         asyncio.run(exchange.close())
         asyncio.run(futures_exchange.close())
         logging.info("CCXT exchanges closed gracefully!")
+
 if __name__ == "__main__":
     main()
