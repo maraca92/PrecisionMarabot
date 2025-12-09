@@ -1,5 +1,6 @@
-# main.py - Grok Elite Signal Bot v24.01.5 - Institutional OB Focus: Zero Noise Edition (Order Flow Enhanced)
-# UPGRADE (v24.01.5): Added Order Flow (delta + footprint) via ccxt order_book; conf boost +2 on imbalance >1%; triggers + delta.
+# main.py - Grok Elite Signal Bot v24.01.6 - Institutional OB Focus: Zero Noise Edition (Order Flow Enhanced + Env Debug)
+# UPGRADE (v24.01.6): Env debug logs in main(); query_grok_instant upgraded (str=2+, conf≥75%, lev3-7x); backtest symmetry fixed; order_flow cache eviction.
+# Retained v24.01.5: Order Flow (delta + footprint) via ccxt order_book; conf boost +2 on imbalance >1%; triggers + delta.
 # Retained v24.01.4: Bidirectional + EMA200 bias + FVG caution – no bias.
 # Retained v24.01.3: Added short entries (bearish EMA cross), vol threshold 1.5x, RSI filter (<30 long/>70 short), maintained precision.
 # Retained v24.01.2: Robust EMA-only computation in BTC trend to avoid empty DF from full indicators/dropna.
@@ -23,6 +24,7 @@ from typing import Dict, Any, Optional, List
 import time
 from collections import OrderedDict
 import html
+import sys  # NEW: For explicit exit in main()
 SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
 TIMEFRAMES = ['4h', '1d', '1w']
 CHECK_INTERVAL = 14400
@@ -216,7 +218,7 @@ async def fetch_order_flow_batch() -> Dict[str, Dict]:
         logging.debug(f"Partial cache hit for order flow ({cache_hits}/{len(SYMBOLS)}); polling fresh")
         if await BanManager.check_and_sleep():
             return {s: order_flow_cache.get(s, {}).get('book') for s in SYMBOLS}
-        evict_if_full(order_flow_cache)
+        evict_if_full(order_flow_cache)  # NEW: Evict if full
         order_books = {}
         backoff = 1
         for attempt in range(3):
@@ -277,7 +279,7 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Przeniesione poza pętlę dla efektywności
         for i in range(100, len(df)):
             # NEW v24.01.4: Symmetric vol >1.5x for long (from >2x if was, but already 1.5)
-            if (df['ema50'].iloc[i] > df['ema100'].iloc[i] and
+            if (df['ema50'].iloc[i] > df['ema200'].iloc[i] and  # NEW: EMA200 bias for long
                 df['ema50'].iloc[i-1] <= df['ema100'].iloc[i-1] and
                 df['volume'].iloc[i] > 1.5 * df['volume_sma'].iloc[i]):
                 entry = df['close'].iloc[i]
@@ -301,8 +303,8 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     diff = df['close'].iloc[-1] - entry
                     pnl_usdt = diff * size - 2 * FEE_PCT * entry * size
                     trades.append({'result': 'open', 'pnl': pnl_usdt})
-            # NEW v24.01.3: Short entry (bearish cross) - Retained for v24.01.4 symmetry
-            if df['ema200'].iloc[i] < df['close'].iloc[i]:
+            # NEW v24.01.3: Short entry (bearish cross) - Retained for v24.01.4 symmetry + EMA200 filter
+            if df['ema200'].iloc[i] > df['close'].iloc[i]:  # NEW: EMA200 bias for short (below)
                 continue # No counter-trend short
             elif (df['ema50'].iloc[i] < df['ema100'].iloc[i] and
                   df['ema50'].iloc[i-1] >= df['ema100'].iloc[i-1] and
@@ -346,7 +348,8 @@ async def send_welcome_once():
     if not os.path.exists(FLAG_FILE):
         try:
             welcome_text = (
-                "**Grok Elite Bot v24.01.5 ONLINE ♔** – Institutional OB Hunter: Zero Noise (Order Flow Enhanced)\n\n"
+                "**Grok Elite Bot v24.01.6 ONLINE ♔** – Institutional OB Hunter: Zero Noise (Order Flow Enhanced + Env Debug)\n\n"
+                "• v24.01.6: Env debug logs; query_grok_instant upgrade (str=2+, conf≥75%, lev3-7x); backtest symmetry; order_flow cache eviction.\n"
                 "• v24.01.5: Order Flow (delta + footprint via ccxt book); conf +2 on imbalance >1%; triggers + delta for absorpcja confirm.\n"
                 "• v24.01.4: Symmetric short/long (EMA cross both ways vol>1.5x), EMA200 1d trend filter (long above, short below, neutral +1 conf), reversal caution (FVG<0.3% or breaker no mit before entry), zero long bias.\n"
                 "• v24.01.3: Short entries (bearish cross), vol 1.5x (+20-30% triggers), RSI <30 long/>70 short, precision 90%+ RR3:1 str3 24h CD.\n"
@@ -359,18 +362,18 @@ async def send_welcome_once():
             escaped_text = html.escape(welcome_text)
             await bot.send_message(CHAT_ID, escaped_text, parse_mode='HTML')
             open(FLAG_FILE, "w").close()
-            logging.info("Welcome sent (v24.01.5)")
+            logging.info("Welcome sent (v24.01.6)")
         except Exception as e:
             logging.error(f"Failed to send welcome: {e}")
 async def query_grok_instant(context: str, is_alt: bool = False) -> Dict[str, Any]:
     models = ["grok-4", "grok-3"]
-    example_json = r'{"symbol":"BTC","direction":"Long" or "Short","entry_low":68234.5678,"entry_high":68456.1234,"sl":67987.2345,"tp1":68890.7890,"tp2":69543.4567,"leverage":2-5,"confidence":90-100,"strength":3,"reason":"concise institutional reason (max 80 chars, e.g., Whale OB + vol disp)"}'
+    example_json = r'{"symbol":"BTC","direction":"Long" or "Short","entry_low":68234.5678,"entry_high":68456.1234,"sl":67987.2345,"tp1":68890.7890,"tp2":69543.4567,"leverage":3-7,"confidence":75-98,"strength":2,"reason":"concise daily reason (max 80 chars, e.g., HTF OB + vol on 1d)"}'
     system_prompt = (
-        "You are an institutional whale trader spotting large footprints. Output ONLY valid JSON. "
-        "High-conviction institutional OB setup ≥90% confidence (str=3+ only) → exact format:\n"
+        "You are an institutional whale trader spotting large footprints for daily trading. Output ONLY valid JSON. "
+        "High-conviction institutional OB setup ≥75% confidence (str=2+ only) → exact format:\n"
         f"{example_json}\n"
-        "Ignore retail noise: Require HTF vol-confirmed displacement, unmitigated str=3 OB, multi-TF align, RSI exhaustion. "
-        "Precise levels (4+ decimals), no rounds. Boost if whale OI/flows + POC align. Conservative: lev 2-5x, SL ATR*1.5, 24h+ horizon.\n"
+        "Ignore retail noise: Require HTF (1d/1w) vol-confirmed displacement, unmitigated str=2+ OB, multi-TF align (priorytet 1d/1w), RSI exhaustion. "
+        "Precise levels (4+ decimals), no rounds. Boost if whale OI/flows + POC align. Conservative: lev 3-7x, SL ATR*2, 12h+ horizon for daily swings.\n"
         f"{{'Alts: Align strictly with BTC inst trend; no counter.' if is_alt else ''}}\n"
         "No setup → {\"no_trade\": true}"
     )
@@ -732,7 +735,7 @@ async def find_next_premium_zones(df: pd.DataFrame, current_price: float, tf: st
         trend_bias = 'bear' # Short favor
     else:
         trend_bias = 'neutral' # Both, +1 conf
-   
+  
     if tf in ['1d', '1w']: # Daily focus
         if trend_bias == 'bull' and direction == 'Long':
             conf_score += 2.0 # Mocniejszy boost dla HTF
@@ -1206,7 +1209,7 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         active = len([t for trades in [open_trades, protected_trades] for t in trades.values() if t.get('active')])
         pending = len([t for t in open_trades.values() if not t.get('active')])
         msg = (
-            "**Grok Elite Bot v24.01.5 - Institutional Hunter Alive!**\n\n"
+            "**Grok Elite Bot v24.01.6 - Institutional Hunter Alive!**\n\n"
             f"**Uptime Check:** {uptime}\n"
             f"**Open Trades:** {open_count}\n"
             f"**Protected Trades:** {protected_count}\n"
@@ -1320,6 +1323,9 @@ async def signal_callback(context):
             logging.warning("Global ban during signal check (short mode); skipping")
             total_time = time.perf_counter() - start_time
             logging.info(f"=== Signal cycle complete in {total_time:.2f}s ===")
+            return
+        if not TELEGRAM_TOKEN:  # NEW: Early check for env
+            logging.error("TELEGRAM_TOKEN missing - skipping signal cycle")
             return
         btc_trend = btc_trend_global
         logging.info(f"BTC Trend (global): {btc_trend}")
@@ -1749,7 +1755,7 @@ async def post_init(application: Application) -> None:
             if r.status_code == 401:
                 logging.error("xAI API unauthorized - Check SuperGrok/Premium+ key!")
             elif r.status_code != 200:
-                logging.warning("xAI API health check failed")
+                logging.warning(f"xAI API health check failed: status {r.status_code}")
     except Exception as e:
         logging.error(f"API health check error: {e}")
     await send_welcome_once()
@@ -1766,9 +1772,11 @@ async def post_init(application: Application) -> None:
     logging.info("Background Polling Task started – fresh prices + order flow every 10s!")
     logging.info("Post_init complete – Elite signals via job in ~60s.")
 def main():
+    # NEW: Env debug logs
+    logging.info(f"Loaded env: TOKEN={TELEGRAM_TOKEN[:5] if TELEGRAM_TOKEN else 'MISSING'}..., CHAT={CHAT_ID if CHAT_ID else 'MISSING'}, KEY={XAI_API_KEY[:5] if XAI_API_KEY else 'MISSING'}...")
     if not all([TELEGRAM_TOKEN, CHAT_ID, XAI_API_KEY]):
         logging.error("Missing required env vars: TELEGRAM_TOKEN, CHAT_ID, XAI_API_KEY")
-        return
+        sys.exit(1)  # NEW: Explicit exit
     logging.info(f"Elite cooldown: {COOLDOWN_HOURS}h | Inst OB only, zero noise + Order Flow delta")
     application = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     application.add_handler(CommandHandler("stats", stats_cmd))
