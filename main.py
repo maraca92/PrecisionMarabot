@@ -1,5 +1,6 @@
-# main.py - Grok Elite Signal Bot v24.01.6 - Institutional OB Focus: Zero Noise Edition (Order Flow Enhanced + Env Debug)
-# UPGRADE (v24.01.6): Env debug logs in main(); query_grok_instant upgraded (str=2+, conf≥75%, lev3-7x); backtest symmetry fixed; order_flow cache eviction.
+# main.py - Grok Elite Signal Bot v24.01.7 - Institutional OB Focus: Zero Noise Edition (Order Flow Enhanced + Env Debug + Relaxed Roadmap)
+# UPGRADE (v24.01.7): Relaxed roadmap generation thresholds (conf>80 from 90, dist<6% from 5%, filter prob>=80 from 85, triggers>=2 from 3) for earlier signals with minimal accuracy trade-off.
+# Retained v24.01.6: Env debug logs in main(); query_grok_instant upgraded (str=2+, conf≥75%, lev3-7x); backtest symmetry fixed; order_flow cache eviction.
 # Retained v24.01.5: Order Flow (delta + footprint) via ccxt order_book; conf boost +2 on imbalance >1%; triggers + delta.
 # Retained v24.01.4: Bidirectional + EMA200 bias + FVG caution – no bias.
 # Retained v24.01.3: Added short entries (bearish EMA cross), vol threshold 1.5x, RSI filter (<30 long/>70 short), maintained precision.
@@ -24,7 +25,7 @@ from typing import Dict, Any, Optional, List
 import time
 from collections import OrderedDict
 import html
-import sys  # NEW: For explicit exit in main()
+import sys # NEW: For explicit exit in main()
 SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
 TIMEFRAMES = ['4h', '1d', '1w']
 CHECK_INTERVAL = 14400
@@ -218,7 +219,7 @@ async def fetch_order_flow_batch() -> Dict[str, Dict]:
         logging.debug(f"Partial cache hit for order flow ({cache_hits}/{len(SYMBOLS)}); polling fresh")
         if await BanManager.check_and_sleep():
             return {s: order_flow_cache.get(s, {}).get('book') for s in SYMBOLS}
-        evict_if_full(order_flow_cache)  # NEW: Evict if full
+        evict_if_full(order_flow_cache) # NEW: Evict if full
         order_books = {}
         backoff = 1
         for attempt in range(3):
@@ -279,7 +280,7 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Przeniesione poza pętlę dla efektywności
         for i in range(100, len(df)):
             # NEW v24.01.4: Symmetric vol >1.5x for long (from >2x if was, but already 1.5)
-            if (df['ema50'].iloc[i] > df['ema200'].iloc[i] and  # NEW: EMA200 bias for long
+            if (df['ema50'].iloc[i] > df['ema200'].iloc[i] and # NEW: EMA200 bias for long
                 df['ema50'].iloc[i-1] <= df['ema100'].iloc[i-1] and
                 df['volume'].iloc[i] > 1.5 * df['volume_sma'].iloc[i]):
                 entry = df['close'].iloc[i]
@@ -304,7 +305,7 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pnl_usdt = diff * size - 2 * FEE_PCT * entry * size
                     trades.append({'result': 'open', 'pnl': pnl_usdt})
             # NEW v24.01.3: Short entry (bearish cross) - Retained for v24.01.4 symmetry + EMA200 filter
-            if df['ema200'].iloc[i] > df['close'].iloc[i]:  # NEW: EMA200 bias for short (below)
+            if df['ema200'].iloc[i] > df['close'].iloc[i]: # NEW: EMA200 bias for short (below)
                 continue # No counter-trend short
             elif (df['ema50'].iloc[i] < df['ema100'].iloc[i] and
                   df['ema50'].iloc[i-1] >= df['ema100'].iloc[i-1] and
@@ -348,7 +349,8 @@ async def send_welcome_once():
     if not os.path.exists(FLAG_FILE):
         try:
             welcome_text = (
-                "**Grok Elite Bot v24.01.6 ONLINE ♔** – Institutional OB Hunter: Zero Noise (Order Flow Enhanced + Env Debug)\n\n"
+                "**Grok Elite Bot v24.01.7 ONLINE ♔** – Institutional OB Hunter: Zero Noise (Order Flow Enhanced + Env Debug + Relaxed Roadmap)\n\n"
+                "• v24.01.7: Relaxed roadmap (conf>80, dist<6%, prob>=80, triggers>=2) for earlier signals, minimal accuracy loss.\n"
                 "• v24.01.6: Env debug logs; query_grok_instant upgrade (str=2+, conf≥75%, lev3-7x); backtest symmetry; order_flow cache eviction.\n"
                 "• v24.01.5: Order Flow (delta + footprint via ccxt book); conf +2 on imbalance >1%; triggers + delta for absorpcja confirm.\n"
                 "• v24.01.4: Symmetric short/long (EMA cross both ways vol>1.5x), EMA200 1d trend filter (long above, short below, neutral +1 conf), reversal caution (FVG<0.3% or breaker no mit before entry), zero long bias.\n"
@@ -362,7 +364,7 @@ async def send_welcome_once():
             escaped_text = html.escape(welcome_text)
             await bot.send_message(CHAT_ID, escaped_text, parse_mode='HTML')
             open(FLAG_FILE, "w").close()
-            logging.info("Welcome sent (v24.01.6)")
+            logging.info("Welcome sent (v24.01.7)")
         except Exception as e:
             logging.error(f"Failed to send welcome: {e}")
 async def query_grok_instant(context: str, is_alt: bool = False) -> Dict[str, Any]:
@@ -427,7 +429,7 @@ def check_rr(trade: Dict[str, Any]) -> bool:
     return rr2 >= 2.0
 async def query_grok_potential(zones: List[Dict], symbol: str, current_price: float, trend: str, btc_trend: Optional[str], atr: float = 0) -> Dict[str, Any]:
     is_alt = symbol != 'BTC/USDT'
-    filtered_zones = [z for z in zones if z.get('strength', 0) >= 3 and z.get('prob', 0) >= 85]
+    filtered_zones = [z for z in zones if z.get('strength', 0) >= 3 and z.get('prob', 0) >= 80]  # RELAXED: from >=85 to >=80
     if not filtered_zones:
         return {"no_live_trade": True, "roadmap": []}
     zone_summary = "\n".join([f"{z['direction']}: {z['zone_low']:.4f}-{z['zone_high']:.4f} ({z['confluence']}, {z['prob']}% prob, {z['dist_pct']:.1f}% away, str{z['strength']})" for z in filtered_zones])
@@ -735,7 +737,7 @@ async def find_next_premium_zones(df: pd.DataFrame, current_price: float, tf: st
         trend_bias = 'bear' # Short favor
     else:
         trend_bias = 'neutral' # Both, +1 conf
-  
+ 
     if tf in ['1d', '1w']: # Daily focus
         if trend_bias == 'bull' and direction == 'Long':
             conf_score += 2.0 # Mocniejszy boost dla HTF
@@ -865,7 +867,7 @@ async def find_next_premium_zones(df: pd.DataFrame, current_price: float, tf: st
     zones = [z for z in zones if z['prob'] >= 75]
     if len(zones) < 2 and tf not in ['1w']:
         zones = []
-    logging.info(f"Filtered to {len(zones)} elite zones >=90% for {symbol} {tf}")
+    logging.info(f"Filtered to {len(zones)} elite zones >=75% for {symbol} {tf}")
     return zones
 def calc_liquidity_profile(df: pd.DataFrame, bins: int = 15) -> Dict[float, float]:
     if len(df) < 50:
@@ -1209,7 +1211,7 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         active = len([t for trades in [open_trades, protected_trades] for t in trades.values() if t.get('active')])
         pending = len([t for t in open_trades.values() if not t.get('active')])
         msg = (
-            "**Grok Elite Bot v24.01.6 - Institutional Hunter Alive!**\n\n"
+            "**Grok Elite Bot v24.01.7 - Institutional Hunter Alive!**\n\n"
             f"**Uptime Check:** {uptime}\n"
             f"**Open Trades:** {open_count}\n"
             f"**Protected Trades:** {protected_count}\n"
@@ -1324,7 +1326,7 @@ async def signal_callback(context):
             total_time = time.perf_counter() - start_time
             logging.info(f"=== Signal cycle complete in {total_time:.2f}s ===")
             return
-        if not TELEGRAM_TOKEN:  # NEW: Early check for env
+        if not TELEGRAM_TOKEN: # NEW: Early check for env
             logging.error("TELEGRAM_TOKEN missing - skipping signal cycle")
             return
         btc_trend = btc_trend_global
@@ -1452,10 +1454,10 @@ async def signal_callback(context):
                     triggers.add(f"Order Flow {dir_str} Delta {delta:.1f}% ({tf})")
             # Retained: Add 'Bearish Short' to strong keywords for symmetry
             strong_triggers = [t for t in triggers if any(kw in t for kw in ['OB str3', 'Displacement', 'Inst Vol', 'Exhaust', 'Bearish Short', 'Order Flow'])] # NEW: + Order Flow
-            logging.info(f"Elite triggers for {symbol}: {len(strong_triggers)} (min 4 req)")
-            if len(strong_triggers) < 3:
+            logging.info(f"Elite triggers for {symbol}: {len(strong_triggers)} (min 2 req)")  # RELAXED: from min 3 to min 2
+            if len(strong_triggers) < 2:  # RELAXED: from <3 to <2
                 sym_time = time.perf_counter() - sym_start
-                logging.info(f"Skipped {symbol}: <4 elite triggers")
+                logging.info(f"Skipped {symbol}: <2 elite triggers")
                 logging.info(f"Finished {symbol} in {sym_time:.2f}s")
                 continue
             premium_zones = []
@@ -1626,10 +1628,10 @@ async def signal_callback(context):
                     if 'roadmap' in grok_potential and grok_potential['roadmap']:
                         conservative_msg = f"**{symbol.replace('/USDT','')} ELITE ROADMAP** | *Price:* {format_price(price)} | *Trend:* {trend}"
                         if is_alt and btc_trend: conservative_msg += f" | *BTC:* {btc_trend}"
-                        conservative_msg += "\n\nElite inst zones (90%+ conf, str=3):\n"
+                        conservative_msg += "\n\nElite inst zones (80%+ conf, str=3):\n"  # RELAXED: from 90% to 80%
                         roadmap_count = 0
                         for i, z in enumerate(grok_potential['roadmap'], 1):
-                            if z['confidence'] > 90 and z['dist_pct'] < 5 and z.get('strength', 0) == 3:
+                            if z['confidence'] > 80 and z['dist_pct'] < 6 and z.get('strength', 0) == 3:  # RELAXED: conf>80 from 90, dist<6 from 5
                                 roadmap_count += 1
                                 entry_low = min(z['entry_low'], z['entry_high'])
                                 entry_high = max(z['entry_low'], z['entry_high'])
@@ -1726,7 +1728,7 @@ async def signal_callback(context):
                             await bot.send_message(CHAT_ID, conservative_msg, parse_mode='Markdown')
                             last_signal_time[symbol] = now
                             sent_roadmap = True
-                    if not sent_roadmap and len(strong_triggers) >= 4:
+                    if not sent_roadmap and len(strong_triggers) >= 2:  # RELAXED: from >=4 to >=2
                         trigger_msg = f"**{symbol.replace('/USDT','')} - Elite Triggers** | *Price:* {format_price(price)} | *Trend:* {trend}"
                         if is_alt and btc_trend: trigger_msg += f" | *BTC:* {btc_trend}"
                         trigger_msg += "\n\n__Inst signals:__\n" + '\n'.join([f"• {t}" for t in sorted(strong_triggers[:6])])
@@ -1776,7 +1778,7 @@ def main():
     logging.info(f"Loaded env: TOKEN={TELEGRAM_TOKEN[:5] if TELEGRAM_TOKEN else 'MISSING'}..., CHAT={CHAT_ID if CHAT_ID else 'MISSING'}, KEY={XAI_API_KEY[:5] if XAI_API_KEY else 'MISSING'}...")
     if not all([TELEGRAM_TOKEN, CHAT_ID, XAI_API_KEY]):
         logging.error("Missing required env vars: TELEGRAM_TOKEN, CHAT_ID, XAI_API_KEY")
-        sys.exit(1)  # NEW: Explicit exit
+        sys.exit(1) # NEW: Explicit exit
     logging.info(f"Elite cooldown: {COOLDOWN_HOURS}h | Inst OB only, zero noise + Order Flow delta")
     application = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     application.add_handler(CommandHandler("stats", stats_cmd))
