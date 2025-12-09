@@ -274,9 +274,9 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         df = add_indicators(df)
         trades = []
         capital = stats['capital']
+        # Przeniesione poza pętlę dla efektywności
         for i in range(100, len(df)):
             # NEW v24.01.4: Symmetric vol >1.5x for long (from >2x if was, but already 1.5)
-            df = add_indicators(df)
             if (df['ema50'].iloc[i] > df['ema100'].iloc[i] and
                 df['ema50'].iloc[i-1] <= df['ema100'].iloc[i-1] and
                 df['volume'].iloc[i] > 1.5 * df['volume_sma'].iloc[i]):
@@ -302,8 +302,8 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pnl_usdt = diff * size - 2 * FEE_PCT * entry * size
                     trades.append({'result': 'open', 'pnl': pnl_usdt})
             # NEW v24.01.3: Short entry (bearish cross) - Retained for v24.01.4 symmetry
-                            if df['ema200'].iloc[i] < df['close'].iloc[i]:
-                    continue  # No counter-trend short
+            if df['ema200'].iloc[i] < df['close'].iloc[i]:
+                continue # No counter-trend short
             elif (df['ema50'].iloc[i] < df['ema100'].iloc[i] and
                   df['ema50'].iloc[i-1] >= df['ema100'].iloc[i-1] and
                   df['volume'].iloc[i] > 1.5 * df['volume_sma'].iloc[i]): # NEW: vol >1.5x (z 2x)
@@ -593,7 +593,6 @@ async def fetch_ticker(symbol: str) -> Optional[float]:
     return prices.get(symbol)
 async def price_background_task():
     """Background task: Polls tickers and order flow every 10s for fresh prices/data."""
-
     while True:
         try:
             prices = await fetch_ticker_batch()
@@ -733,10 +732,10 @@ async def find_next_premium_zones(df: pd.DataFrame, current_price: float, tf: st
         trend_bias = 'bear' # Short favor
     else:
         trend_bias = 'neutral' # Both, +1 conf
-    
-    if tf in ['1d', '1w']:  # Daily focus
+   
+    if tf in ['1d', '1w']: # Daily focus
         if trend_bias == 'bull' and direction == 'Long':
-            conf_score += 2.0  # Mocniejszy boost dla HTF
+            conf_score += 2.0 # Mocniejszy boost dla HTF
         elif trend_bias == 'bear' and direction == 'Short':
             conf_score += 2.0
     logging.info(f"EMA200 bias for {symbol} {tf}: {trend_bias} (price {price_current:.4f} vs EMA {ema200_val:.4f})")
@@ -1032,7 +1031,6 @@ async def process_trade(trades: Dict[str, Any], to_delete: List[str], now: datet
                 tag = ('(*roadmap*)' if trade.get('type') == 'roadmap' else ('(*protected*)' if is_protected else ''))
                 if tag == '(*roadmap*)':
                     logging.info(f"Roadmap ENTRY ACTIVATED for {clean_symbol} @ {price:.4f} (conf {trade['confidence']}%)")
-
                 await bot.send_message(CHAT_ID,
                                        f"**ENTRY ACTIVATED** {tag} (Size: {trade['position_size']:.4f}){slippage_note}\n\n"
                                        f"**{clean_symbol.replace('/USDT','')} {trade['direction']}** @ {format_price(price)}\n"
