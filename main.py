@@ -66,7 +66,7 @@ prices_global: Dict[str, Optional[float]] = {s: None for s in SYMBOLS}
 last_price_update: float = 0.0
 last_ban_check: float = 0.0
 btc_trend_global = "Unknown"
-background_task = None  # NEW: Track background task for graceful shutdown
+background_task = None # NEW: Track background task for graceful shutdown
 TRADE_TIMEOUT_HOURS = 24
 PROTECT_AFTER_HOURS = 6
 FEE_PCT = 0.04
@@ -601,7 +601,7 @@ async def fetch_ohlcv(symbol: str, tf: str, limit: int = 200, since: Optional[in
                 df['date'] = pd.to_datetime(df['ts'], unit='ms')
                 # NEW FIX: Set sorted DatetimeIndex for VWAP compatibility
                 df = df.set_index('date').sort_index()
-                df = df.reset_index()  # Keep 'date' as column for other uses
+                df = df.reset_index() # Keep 'date' as column for other uses
                 ohlcv_cache[cache_key] = {'df': df, 'timestamp': now}
                 success = True
                 logging.info(f"OHLCV fetched for {symbol} {tf} (attempt {attempt+1})")
@@ -1792,7 +1792,7 @@ async def signal_callback(context):
         total_time = time.perf_counter() - start_time
         logging.info(f"=== Signal cycle complete in {total_time:.2f}s (error) ===")
 async def post_init(application: Application) -> None:
-    global background_task  # NEW: Global for shutdown
+    global background_task # NEW: Global for shutdown
     logging.info("Starting post_init: Sending welcome and setting webhook...")
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -1817,11 +1817,11 @@ async def post_init(application: Application) -> None:
     logging.info(f"Setting webhook to: {webhook_url}")
     await application.bot.set_webhook(url=webhook_url)
     logging.info("Webhook set successfully. Jobs will now run.")
-    background_task = asyncio.create_task(price_background_task())  # NEW: Assign to global
+    background_task = asyncio.create_task(price_background_task()) # NEW: Assign to global
     logging.info("Background Polling Task started – fresh prices + order flow every 10s!")
     logging.info("Post_init complete – Daily signals via job in ~60s.")
 def main():
-    global background_task  # NEW: Access global for cleanup
+    global background_task # NEW: Access global for cleanup
     # Env debug logs
     logging.info(f"Loaded env: TOKEN={TELEGRAM_TOKEN[:5] if TELEGRAM_TOKEN else 'MISSING'}..., CHAT={CHAT_ID if CHAT_ID else 'MISSING'}, KEY={XAI_API_KEY[:5] if XAI_API_KEY else 'MISSING'}...")
     if not all([TELEGRAM_TOKEN, CHAT_ID, XAI_API_KEY]):
@@ -1886,15 +1886,10 @@ def main():
         # NEW FIX: Graceful background task cancellation
         if background_task and not background_task.done():
             background_task.cancel()
-            try:
-                await background_task
-                logging.info("Background task cancelled cleanly")
-            except asyncio.CancelledError:
-                pass
+            logging.info("Background task cancelled")
         # Existing CCXT close with added sleep for throttler drain
         asyncio.run(exchange.close())
         asyncio.run(futures_exchange.close())
-        await asyncio.sleep(1)  # NEW: Short drain for CCXT internal tasks
         logging.info("CCXT exchanges closed gracefully!")
 if __name__ == "__main__":
     main()
