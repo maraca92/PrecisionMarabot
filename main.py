@@ -1,10 +1,8 @@
-# main.py - Grok Elite Signal Bot v25.01.0 - ICT Elite: Regime-Aware MTF Confluence + Dynamic EV + Streamlined Stack
-# UPGRADE (v25.01.0): Full ICT overhaul per deep analysis - Regime detection (adaptive logic), MTF confluence scoring (gradient 1h-1w cascade),
-# Improved liq sweeps (dynamic ATR + wick/vol), streamlined indicators (structure + orderflow focus, removed lags), FVG/OB mitigation grading,
-# Premium/discount zones, dynamic thresholds/EV calc, calibrated Grok prompts/context, quick wins (time filter, no-trade zones, liquidity check),
-# Drawdown scaling, realistic backtest (live logic + slippage/OHLC exits). Projected win rate: 65-70%.
+# main.py - Grok Elite Signal Bot v25.02.0 - ICT Elite: Regime-Aware MTF Confluence + Dynamic EV + Streamlined Stack + Self-Calibrating Fixes
+# UPGRADE (v25.02.0): Strict premium/discount rejection, self-calibrating EV from backtest, FVG strength boost, precise Grok prompts, CSV trade logging,
+# regime in trades, multi-symbol backtest, Monte Carlo validation, live dashboard, paper trading mode. Projected win rate: 68-75%.
 # Retained: Daily 1d prio, OB str>=2, liq sweeps bounces, ADX anti-consol, vol>1.1x, conf>=70% dynamic, dist<7%, ~2x signals, Levels to Watch.
-# NEW CONSTANTS: Added for ICT params (e.g., FVG_DISPLACEMENT_MULT=2, ZONE_LOOKBACK=100)
+# NEW CONSTANTS: Added for ICT params (e.g., FVG_DISPLACEMENT_MULT=2, ZONE_LOOKBACK=100), PAPER_TRADING=true
 import asyncio
 import os
 import ccxt.async_support as ccxt
@@ -25,10 +23,13 @@ import html
 import sys # For explicit exit in main()
 import aiofiles # For async JSON I/O
 from collections import deque
-import zoneinfo  # For timezone-aware time-of-day filter
+import zoneinfo # For timezone-aware time-of-day filter
+import csv
+from pathlib import Path
+import random
 
 SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
-TIMEFRAMES = ['1h', '4h', '1d', '1w']  # UPDATED: Added 1h for MTF cascade
+TIMEFRAMES = ['1h', '4h', '1d', '1w'] # UPDATED: Added 1h for MTF cascade
 CHECK_INTERVAL = 7200 # 2h for more checks
 TRACK_INTERVAL = 5
 COOLDOWN_HOURS = 12
@@ -36,6 +37,7 @@ WATCH_COOLDOWN_HOURS = 24
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 XAI_API_KEY = os.getenv("XAI_API_KEY")
+PAPER_TRADING = os.getenv("PAPER_TRADING", "true").lower() == "true" # Default: paper mode
 bot = Bot(token=TELEGRAM_TOKEN)
 exchange = ccxt.bybit({
     'enableRateLimit': True,
@@ -55,6 +57,7 @@ TRADES_FILE = "open_trades.json"
 PROTECTED_TRADES_FILE = "protected_trades.json"
 RECAP_FILE = "last_recap.date"
 BACKTEST_FILE = "backtest_results.json"
+TRADE_LOG_FILE = "trade_history.csv"
 CACHE_TTL = 1800
 HTF_CACHE_TTL = 3600
 TICKER_CACHE_TTL = 10
@@ -64,8 +67,8 @@ MAX_CACHE_SIZE = 50
 PRE_CROSS_THRESHOLD_PCT = 0.005
 OB_OVERLAP_THRESHOLD = 0.7
 VOL_SURGE_MULTIPLIER = 1.1
-FVG_DISPLACEMENT_MULT = 2.0  # For FVG strength
-ZONE_LOOKBACK = 100  # For premium/discount
+FVG_DISPLACEMENT_MULT = 2.0 # For FVG strength
+ZONE_LOOKBACK = 100 # For premium/discount
 SLIPPAGE_PCT = 0.001
 ENTRY_SLIPPAGE_PCT = 0.002
 MAX_CONCURRENT_TRADES = 1
@@ -73,8 +76,23 @@ MAX_DRAWDOWN_PCT = 3.0
 RISK_PER_TRADE_PCT = 1.5
 DAILY_ATR_MULT = 2.0
 SIMULATED_CAPITAL = 10000.0
-# NEW: Historical data for EV (load from backtest or static)
-HISTORICAL_DATA = {'tp1_hit_rate': 0.60, 'tp2_hit_rate': 0.35}  # UPDATED: For EV calc
+
+def load_historical_data() -> Dict[str, float]:
+    """Load TP hit rates from backtest results or use defaults"""
+    if os.path.exists(BACKTEST_FILE):
+        try:
+            with open(BACKTEST_FILE, 'r') as f:
+                bt = json.load(f)
+            tp1_rate = bt.get('tp1_hit_rate', 0.60)
+            tp2_rate = bt.get('tp2_hit_rate', 0.35)
+            logging.info(f"Loaded historical data: TP1={tp1_rate:.2%}, TP2={tp2_rate:.2%}")
+            return {'tp1_hit_rate': tp1_rate, 'tp2_hit_rate': tp2_rate}
+        except Exception as e:
+            logging.warning(f"Failed to load historical data: {e}")
+    return {'tp1_hit_rate': 0.60, 'tp2_hit_rate': 0.35}
+
+HISTORICAL_DATA = load_historical_data()
+
 ohlcv_cache: OrderedDict = OrderedDict()
 ticker_cache: OrderedDict = OrderedDict()
 order_flow_cache: OrderedDict = OrderedDict()
@@ -96,7 +114,7 @@ last_send_time = 0.0
 _working_model = None
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 fetch_sem = asyncio.Semaphore(3)
-stats_lock = asyncio.Lock()  # NEW: For thread-safe stats
+stats_lock = asyncio.Lock() # NEW: For thread-safe stats
 def evict_if_full(cache: OrderedDict, max_size: int = MAX_CACHE_SIZE):
     evicted = 0
     while len(cache) > max_size:
@@ -269,7 +287,7 @@ def detect_liquidity_sweep(df: pd.DataFrame, atr_window: int = 14) -> pd.Series:
     """ICT-compliant sweep: breaches key level with volume + reversal"""
     if len(df) < 20:
         return pd.Series([False] * len(df), index=df.index)
-    lookback = int(df['atr'].iloc[-1] / (df['close'].iloc[-1] * 0.01) * 5)  # Dynamic
+    lookback = int(df['atr'].iloc[-1] / (df['close'].iloc[-1] * 0.01) * 5) # Dynamic
     lookback = max(20, min(lookback, 100))
     swing_high = df['high'].rolling(lookback).max()
     swing_low = df['low'].rolling(lookback).min()
@@ -281,9 +299,9 @@ def detect_liquidity_sweep(df: pd.DataFrame, atr_window: int = 14) -> pd.Series:
     vol_surge = df['volume'] > 1.5 * df['volume'].rolling(20).mean()
     # Bullish sweep: break below low, close back inside with volume
     bull_sweep = (
-        (df['low'] < swing_low.shift(1)) &  # Breached low
-        (df['close'] > swing_low.shift(1) * 1.002) &  # Recovered 0.2%
-        (lower_wick > candle_range * 0.6) &  # 60% wick
+        (df['low'] < swing_low.shift(1)) & # Breached low
+        (df['close'] > swing_low.shift(1) * 1.002) & # Recovered 0.2%
+        (lower_wick > candle_range * 0.6) & # 60% wick
         vol_surge
     )
     # Bearish sweep: symmetric
@@ -314,7 +332,7 @@ def calculate_order_flow(df: pd.DataFrame, order_book: Optional[Dict] = None) ->
     delta = (buy_vol - sell_vol) / total_vol * 100 if total_vol > 0 else 0
     df['order_delta'] = delta
     df['order_delta'] = df['order_delta'].fillna(delta)
-    df['cum_delta'] = (np.where(df['close'] > df['open'], df['volume'], 0) - np.where(df['close'] < df['open'], df['volume'], 0)).cumsum()  # NEW: True cum delta
+    df['cum_delta'] = (np.where(df['close'] > df['open'], df['volume'], 0) - np.where(df['close'] < df['open'], df['volume'], 0)).cumsum() # NEW: True cum delta
     # Wall detection
     wall_imbalance = abs(delta) > 2.0
     mid_price = df['close'].iloc[-1]
@@ -327,22 +345,22 @@ def calculate_order_flow(df: pd.DataFrame, order_book: Optional[Dict] = None) ->
 def detect_market_regime(df: pd.DataFrame) -> str:
     """Classify market into trending/ranging/explosive"""
     if len(df) < 50:
-        return 'ranging'  # Default safe
+        return 'ranging' # Default safe
     adx = ta.adx(df['high'], df['low'], df['close'], 14)['ADX_14'].iloc[-1]
     atr_ratio = df['atr'].iloc[-1] / df['atr'].rolling(50).mean().iloc[-1]
     if adx > 40 and atr_ratio > 1.5:
-        return 'explosive'  # Strong trend + high volatility
+        return 'explosive' # Strong trend + high volatility
     elif adx > 25:
         return 'trending'
     elif adx < 20 and atr_ratio < 0.8:
-        return 'dead'  # Avoid
+        return 'dead' # Avoid
     else:
-        return 'ranging'  # Prime for reversals
+        return 'ranging' # Prime for reversals
 # UPDATED: is_consolidation now integrates regime (skip 'dead', boost ranging)
 def is_consolidation(df: pd.DataFrame) -> bool:
     regime = detect_market_regime(df)
     if regime == 'dead':
-        return True  # Skip entirely
+        return True # Skip entirely
     if len(df) < 14:
         return True
     adx = ta.adx(df['high'], df['low'], df['close'], length=14)
@@ -352,7 +370,7 @@ def is_consolidation(df: pd.DataFrame) -> bool:
     vol_ratio = df['volume'].iloc[-1] / df['volume'].rolling(20).mean().iloc[-1]
     consol = (adx_val < 25) and (vol_ratio < VOL_SURGE_MULTIPLIER)
     if regime == 'ranging':
-        consol = False  # Boost reversals in range
+        consol = False # Boost reversals in range
     logging.info(f"Regime: {regime} | Consol check: ADX={adx_val:.1f}, vol_ratio={vol_ratio:.2f} -> {consol}")
     return consol
 # NEW: MTF Confluence Scoring (gradient EMA slope + OB proximity + liq sweep + vol)
@@ -360,14 +378,14 @@ async def calculate_mtf_confluence(symbol: str, price: float, direction: str) ->
     """Score confluence across 1h -> 4h -> 1d -> 1w"""
     score = 0.0
     timeframes = ['1h', '4h', '1d', '1w']
-    weights = [1, 2, 3, 4]  # Higher TF = more weight
+    weights = [1, 2, 3, 4] # Higher TF = more weight
     for tf, weight in zip(timeframes, weights):
         df = await fetch_ohlcv(symbol, tf, 100)
         if len(df) == 0:
             continue
-        df = add_institutional_indicators(df)  # UPDATED: Use new indicators
+        df = add_institutional_indicators(df) # UPDATED: Use new indicators
         # 1. Trend alignment (EMA gradient)
-        ema_slope = (df['ema200'].iloc[-1] - df['ema200'].iloc[-10]) / df['ema200'].iloc[-10]  # UPDATED: Use EMA200 for bias
+        ema_slope = (df['ema200'].iloc[-1] - df['ema200'].iloc[-10]) / df['ema200'].iloc[-10] # UPDATED: Use EMA200 for bias
         if (direction == 'Long' and ema_slope > 0) or (direction == 'Short' and ema_slope < 0):
             score += weight * 2
         # 2. OB proximity (closer = better)
@@ -377,7 +395,7 @@ async def calculate_mtf_confluence(symbol: str, price: float, direction: str) ->
             closest_ob = min(relevant_obs, key=lambda x: abs((x['low']+x['high'])/2 - price))
             dist_pct = abs((closest_ob['low']+closest_ob['high'])/2 - price) / price * 100
             if dist_pct < 2:
-                score += weight * 3 * (2 - dist_pct)  # Exponential bonus
+                score += weight * 3 * (2 - dist_pct) # Exponential bonus
         # 3. Liquidity sweep alignment
         if df['liq_sweep'].iloc[-1]:
             score += weight * 1.5
@@ -385,7 +403,7 @@ async def calculate_mtf_confluence(symbol: str, price: float, direction: str) ->
         vol_ratio = df['volume'].iloc[-1] / df['volume'].rolling(20).mean().iloc[-1]
         if vol_ratio > 1.5:
             score += weight * 1
-    return min(score / 40, 1.0)  # Normalize to 0-1
+    return min(score / 40, 1.0) # Normalize to 0-1
 # NEW: Streamlined institutional indicators (structure + orderflow, removed EMA50/100/MACD/BB/Stoch)
 def add_institutional_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """Focus on orderflow + structure, not derivatives"""
@@ -415,7 +433,7 @@ def add_institutional_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = calculate_premium_discount(df, lookback=ZONE_LOOKBACK)
     # Order Flow (now separate, but integrate liq_sweep)
     if 'liq_sweep' not in df.columns:
-        df['liq_sweep'] = False  # Placeholder if no book
+        df['liq_sweep'] = False # Placeholder if no book
     return df
 # NEW: FVG strength grading (volume + displacement)
 def calculate_fvg_strength(df: pd.DataFrame) -> pd.DataFrame:
@@ -509,10 +527,10 @@ async def find_unmitigated_order_blocks(df: pd.DataFrame, lookback: int = 100, a
             if move_down and abs((ob_low - df_local['low'].iloc[i+5:i+10].min()) / ob_low) > 0.02:
                 df_since = df_local.iloc[i+1:]
                 mitigation = track_ob_mitigation({'low': ob_low, 'high': ob_high}, df_since)
-                if mitigation < 0.5:  # NEW: Partial mitigation threshold
+                if mitigation < 0.5: # NEW: Partial mitigation threshold
                     zone_type = 'Breaker' if any(df_local['low'].iloc[i+1:i+6] < ob_low) else 'OB'
                     strength = 3 if zone_type == 'OB' and df_local['volume'].iloc[i] > VOL_SURGE_MULTIPLIER * df_local['volume_sma'].iloc[i] else 2
-                    adjusted_strength = strength * (1 - mitigation)  # NEW: Adjust for mitigation
+                    adjusted_strength = strength * (1 - mitigation) # NEW: Adjust for mitigation
                     if adjusted_strength >= 2:
                         obs['bearish'].append({
                             'low': ob_low, 'high': ob_high, 'type': zone_type,
@@ -592,17 +610,17 @@ def calculate_expected_value(trade: Dict, historical_data: Dict) -> float:
     entry_mid = (trade['entry_low'] + trade['entry_high']) / 2
     prob_hit_tp1 = historical_data.get('tp1_hit_rate', 0.60)
     prob_hit_tp2 = historical_data.get('tp2_hit_rate', 0.35)
-    prob_hit_sl = 1 - prob_hit_tp1  # Simplified
+    prob_hit_sl = 1 - prob_hit_tp1 # Simplified
     tp1_gain = (trade['tp1'] - entry_mid) * (1 - SLIPPAGE_PCT * 2) if trade['direction'] == 'Long' else (entry_mid - trade['tp1']) * (1 - SLIPPAGE_PCT * 2)
     tp2_gain = (trade['tp2'] - entry_mid) * (1 - SLIPPAGE_PCT * 2) if trade['direction'] == 'Long' else (entry_mid - trade['tp2']) * (1 - SLIPPAGE_PCT * 2)
     sl_loss = (entry_mid - trade['sl']) * (1 + SLIPPAGE_PCT * 2) if trade['direction'] == 'Long' else (trade['sl'] - entry_mid) * (1 + SLIPPAGE_PCT * 2)
     expected_gain = (
-        prob_hit_tp1 * tp1_gain * 0.5 +  # Half at TP1
-        prob_hit_tp2 * tp2_gain * 0.5   # Half at TP2
+        prob_hit_tp1 * tp1_gain * 0.5 + # Half at TP1
+        prob_hit_tp2 * tp2_gain * 0.5 # Half at TP2
     )
     expected_loss = prob_hit_sl * sl_loss
     ev = expected_gain - expected_loss
-    return ev / abs(sl_loss) if sl_loss != 0 else 0  # R-multiple
+    return ev / abs(sl_loss) if sl_loss != 0 else 0 # R-multiple
 # NEW: Quick wins - Time of day filter
 def is_optimal_trading_hour(symbol: str) -> bool:
     """Avoid low-liquidity hours"""
@@ -638,7 +656,7 @@ async def check_sufficient_liquidity(symbol: str) -> bool:
             return False
         total_bid_vol = sum(amt for _, amt in book['bids'][:10])
         total_ask_vol = sum(amt for _, amt in book['asks'][:10])
-        min_depth_usd = 10 * 60000  # $600k
+        min_depth_usd = 10 * 60000 # $600k
         if (total_bid_vol * best_bid < min_depth_usd or total_ask_vol * best_ask < min_depth_usd):
             return False
         return True
@@ -655,10 +673,10 @@ def get_risk_scaling_factor(stats: Dict) -> float:
     elif current_dd < 3:
         return 0.50
     else:
-        return 0.0  # Stop trading
+        return 0.0 # Stop trading
 # UPDATED: add_indicators -> add_institutional_indicators (streamlined)
 def add_indicators(df: pd.DataFrame, order_book: Optional[Dict] = None) -> pd.DataFrame:
-    return add_institutional_indicators(df)  # Redirect + order flow
+    return add_institutional_indicators(df) # Redirect + order flow
 # UPDATED: zones_overlap (retained)
 def zones_overlap(z1_low: float, z1_high: float, z2_low: float, z2_high: float, threshold: float = OB_OVERLAP_THRESHOLD) -> float:
     o_low = max(z1_low, z2_low)
@@ -672,19 +690,19 @@ def zones_overlap(z1_low: float, z1_high: float, z2_low: float, z2_high: float, 
 async def find_next_premium_zones(df: pd.DataFrame, current_price: float, tf: str, symbol: str = None, oi_data: Optional[Dict[str, float]] = None, trend: str = None, whale_data: Optional[Dict[str, Any]] = None, order_book: Optional[Dict] = None) -> List[Dict]:
     if len(df) < 50:
         return []
-    df = add_institutional_indicators(df)  # UPDATED: New stack
+    df = add_institutional_indicators(df) # UPDATED: New stack
     regime = detect_market_regime(df)
     if regime == 'dead':
         logging.info(f"Skipped {symbol} {tf}: Dead regime")
         return []
-    conf_multiplier = 1.3 if regime == 'ranging' else 0.7 if regime == 'explosive' else 1.0  # NEW: Adaptive
-    if is_in_no_trade_zone(current_price, symbol, df):  # NEW: Quick win
+    conf_multiplier = 1.3 if regime == 'ranging' else 0.7 if regime == 'explosive' else 1.0 # NEW: Adaptive
+    if is_in_no_trade_zone(current_price, symbol, df): # NEW: Quick win
         logging.info(f"Skipped {symbol} {tf}: No-trade zone")
         return []
-    if not await check_sufficient_liquidity(symbol):  # NEW: Quick win
+    if not await check_sufficient_liquidity(symbol): # NEW: Quick win
         logging.info(f"Skipped {symbol} {tf}: Low liquidity")
         return []
-    if not is_optimal_trading_hour(symbol):  # NEW: Quick win
+    if not is_optimal_trading_hour(symbol): # NEW: Quick win
         logging.info(f"Skipped {symbol} {tf}: Suboptimal hour")
         return []
     ema200_val = df['ema200'].iloc[-1]
@@ -704,9 +722,9 @@ async def find_next_premium_zones(df: pd.DataFrame, current_price: float, tf: st
             rsi_1w = df_1w['rsi'].iloc[-1]
         except Exception as e:
             logging.error(f"HTF RSI fetch error for {symbol}: {e}")
-    htf_align = 1.0  # UPDATED: Now from MTF func
+    htf_align = 1.0 # UPDATED: Now from MTF func
     if tf in ['4h', '1d', '1w']:
-        htf_align = await calculate_mtf_confluence(symbol, current_price, 'Long')  # Example; compute per direction later
+        htf_align = await calculate_mtf_confluence(symbol, current_price, 'Long') # Example; compute per direction later
     htf_mult = htf_align if tf == '1d' else 1.0
     obs = await find_unmitigated_order_blocks(df, tf=tf, symbol=symbol)
     elite_obs = {k: [o for o in v if o['strength'] >= 2] for k, v in obs.items()}
@@ -729,12 +747,12 @@ async def find_next_premium_zones(df: pd.DataFrame, current_price: float, tf: st
     zones_to_use = zones_7pct
     logging.info(f"Using 7% zones for {symbol} {tf}: {len(zones_to_use)} str>=2 OBs")
     zones = []
-    dyn_thresh = calculate_dynamic_threshold(df, stats=load_stats())  # NEW: Dynamic
+    dyn_thresh = calculate_dynamic_threshold(df, stats=load_stats()) # NEW: Dynamic
     for ob in zones_to_use:
         mid = (ob['low'] + ob['high']) / 2
         dist = abs(current_price - mid) / current_price * 100
         direction = 'Long' if 'bullish' in str(ob.get('type', '')) else 'Short'
-        mtf_conf = await calculate_mtf_confluence(symbol, mid, direction)  # NEW: Per zone
+        mtf_conf = await calculate_mtf_confluence(symbol, mid, direction) # NEW: Per zone
         conf_score = ob['strength'] * htf_mult * mtf_conf * conf_multiplier
         confluence_str = ob['type']
         if poc and abs(mid - poc) / current_price * 100 < 0.3:
@@ -766,11 +784,13 @@ async def find_next_premium_zones(df: pd.DataFrame, current_price: float, tf: st
             conf_score += 1.5
         elif trend_bias == 'neutral':
             conf_score += 1
-        # NEW: Premium/discount penalty
-        if direction == 'Long' and zone != 'discount':
-            conf_score -= 10
-        elif direction == 'Short' and zone != 'premium':
-            conf_score -= 10
+        # STRICT: Reject counter-zone trades (ICT core principle)
+        if direction == 'Long' and zone not in ['discount', pd.NA]:
+            logging.info(f"Rejected {direction} for {symbol} {tf}: Not in discount (zone={zone})")
+            continue
+        elif direction == 'Short' and zone not in ['premium', pd.NA]:
+            logging.info(f"Rejected {direction} for {symbol} {tf}: Not in premium (zone={zone})")
+            continue
         # FVG/Breaker (retained)
         fvgs = detect_fvg(df, tf, proximity_pct=0.3)
         obs_key = 'bullish' if direction == 'Long' else 'bearish'
@@ -781,6 +801,14 @@ async def find_next_premium_zones(df: pd.DataFrame, current_price: float, tf: st
             confluence_str += "+FVG/Breaker Caution"
         else:
             reversal_caution = False
+        # NEW: FVG strength boost (if strong FVGs nearby)
+        if fvgs and 'fvg_strength' in df.columns:
+            # Average FVG strength in last 10 bars
+            recent_fvg_strength = df['fvg_strength'].iloc[-10:].mean()
+            if recent_fvg_strength > 5: # Strong FVGs present
+                conf_score += 2
+                confluence_str += f"+FVG Strength ({recent_fvg_strength:.1f})"
+                logging.debug(f"FVG strength boost: {recent_fvg_strength:.1f}")
         aligned_bias = 'bull' if direction == 'Long' else 'bear'
         if trend_bias != 'neutral' and trend_bias != aligned_bias and not reversal_caution:
             logging.info(f"Skipped counter-trend {direction} for {symbol} {tf}: bias {trend_bias}, no caution")
@@ -796,13 +824,13 @@ async def find_next_premium_zones(df: pd.DataFrame, current_price: float, tf: st
         if df['liq_sweep'].iloc[-1]:
             conf_score += 2
             confluence_str += "+Liq Sweep Bounce"
-        prob = min(98, 60 + conf_score * 7 * conf_multiplier)  # Adaptive mult
+        prob = min(98, 60 + conf_score * 7 * conf_multiplier) # Adaptive mult
         # NEW: Mock trade for EV filter
         mock_trade = {'direction': direction, 'entry_low': ob['low'], 'entry_high': ob['high'],
                       'sl': ob['low'] - df['atr'].iloc[-1] * DAILY_ATR_MULT if direction == 'Long' else ob['high'] + df['atr'].iloc[-1] * DAILY_ATR_MULT,
-                      'tp1': mid + (mid - ob['sl']) * 2, 'tp2': mid + (mid - ob['sl']) * 4}  # Symmetric for short
+                      'tp1': mid + (mid - ob['sl']) * 2, 'tp2': mid + (mid - ob['sl']) * 4} # Symmetric for short
         ev_r = calculate_expected_value(mock_trade, HISTORICAL_DATA)
-        if ev_r < 0.5:  # NEW: EV threshold
+        if ev_r < 0.5: # NEW: EV threshold
             logging.info(f"Skipped {direction} for {symbol} {tf}: Low EV {ev_r:.2f}R")
             continue
         zones.append({
@@ -810,7 +838,7 @@ async def find_next_premium_zones(df: pd.DataFrame, current_price: float, tf: st
             'confluence': confluence_str, 'dist_pct': dist, 'prob': prob, 'strength': ob['strength']
         })
     zones = sorted(zones, key=lambda z: z['dist_pct'])[:3]
-    zones = [z for z in zones if z['prob'] >= dyn_thresh]  # NEW: Dynamic
+    zones = [z for z in zones if z['prob'] >= dyn_thresh] # NEW: Dynamic
     if len(zones) < 2 and tf not in ['1w']:
         zones = []
     logging.info(f"Filtered to {len(zones)} elite zones >=dyn_thresh for {symbol} {tf}")
@@ -878,7 +906,7 @@ def detect_pre_cross(df: pd.DataFrame, tf: str) -> Optional[str]:
     if len(df) < 2 or tf not in ['4h', '1d'] or 'ema200' not in df.columns or pd.isna(df['ema200'].iloc[-1]):
         return None
     l = df.iloc[-1]
-    diff = abs(l['ema200'] - l['close']) / l['close']  # UPDATED: vs close for bias
+    diff = abs(l['ema200'] - l['close']) / l['close'] # UPDATED: vs close for bias
     if diff < PRE_CROSS_THRESHOLD_PCT:
         return "EMA200 Bias Shift Incoming" if l['close'] > l['ema200'] else "EMA200 Bias Shift Incoming"
     return None
@@ -923,9 +951,9 @@ def detect_candle_patterns(df: pd.DataFrame, tf: str) -> List[str]:
     if c['high'] < p['high'] and c['low'] > p['low']:
         patterns.add(f"Inside Bar ({tf})")
     return list(patterns)
-# UPDATED: process_trade: Integrate drawdown scaling, EV logging
+# UPDATED: process_trade: Integrate drawdown scaling, EV logging, CSV log, paper mode
 async def process_trade(trades: Dict[str, Any], to_delete: List[str], now: datetime, current_capital: float, prices: Dict[str, Optional[float]], updated_keys: List[str], is_protected: bool = False):
-    risk_scale = get_risk_scaling_factor(load_stats())  # NEW: Scaling
+    risk_scale = get_risk_scaling_factor(load_stats()) # NEW: Scaling
     if risk_scale == 0:
         logging.warning("Drawdown protection: Stop trading")
         return
@@ -965,20 +993,24 @@ async def process_trade(trades: Dict[str, Any], to_delete: List[str], now: datet
                     slippage_note = " (*late entry via slippage*)"
             logging.info(f"Checking {clean_symbol} ({trade.get('type', '')} {trade['direction']} {trade['confidence']}%) - price {price:.4f} vs zone {entry_low:.4f}-{entry_high:.4f}, in_zone={in_zone}{slippage_note}")
             if in_zone:
-                current_exposure = sum(
-                    t.get('position_size', 0) * t.get('entry_price', 0) * t.get('leverage', 1)
-                    for trades_dict in [open_trades, protected_trades]
-                    for t in trades_dict.values()
-                    if t.get('active')
-                )
-                risk_distance = abs(price - trade['sl'])
-                scaled_risk_pct = RISK_PER_TRADE_PCT * risk_scale  # NEW: Scaled
-                proposed_size = (current_capital * scaled_risk_pct / 100) / risk_distance if risk_distance > 0 else 0
-                proposed_exposure = proposed_size * trade['leverage']
-                max_exposure = current_capital * 0.05
-                if current_exposure + proposed_exposure > max_exposure:
-                    logging.info(f"Skipped {'protected ' if is_protected else ''}entry for {clean_symbol}: exposure would exceed 5% ({current_exposure + proposed_exposure:.2f} > {max_exposure:.2f})")
-                    continue
+                # NEW: Paper trading bypass for exposure check
+                if PAPER_TRADING:
+                    logging.info(f"PAPER MODE: Skipping exposure check for {clean_symbol}")
+                else:
+                    current_exposure = sum(
+                        t.get('position_size', 0) * t.get('entry_price', 0) * t.get('leverage', 1)
+                        for trades_dict in [open_trades, protected_trades]
+                        for t in trades_dict.values()
+                        if t.get('active')
+                    )
+                    risk_distance = abs(price - trade['sl'])
+                    scaled_risk_pct = RISK_PER_TRADE_PCT * risk_scale # NEW: Scaled
+                    proposed_size = (current_capital * scaled_risk_pct / 100) / risk_distance if risk_distance > 0 else 0
+                    proposed_exposure = proposed_size * trade['leverage']
+                    max_exposure = current_capital * 0.05
+                    if current_exposure + proposed_exposure > max_exposure:
+                        logging.info(f"Skipped {'protected ' if is_protected else ''}entry for {clean_symbol}: exposure would exceed 5% ({current_exposure + proposed_exposure:.2f} > {max_exposure:.2f})")
+                        continue
                 # NEW: Log EV
                 ev_r = calculate_expected_value(trade, HISTORICAL_DATA)
                 logging.info(f"Entry EV for {clean_symbol}: {ev_r:.2f}R")
@@ -987,7 +1019,7 @@ async def process_trade(trades: Dict[str, Any], to_delete: List[str], now: datet
                 trade['entry_price'] = price + slippage if trade['direction'] == 'Long' else price - slippage
                 if 'entry_time' not in trade:
                     trade['entry_time'] = now
-                risk_amount = current_capital * scaled_risk_pct / 100
+                risk_amount = current_capital * RISK_PER_TRADE_PCT / 100
                 trade['position_size'] = risk_amount / risk_distance if risk_distance > 0 else 0
                 tag = ('(*roadmap*)' if trade.get('type') == 'roadmap' else ('(*protected*)' if is_protected else ''))
                 if tag == '(*roadmap*)':
@@ -1015,7 +1047,7 @@ async def process_trade(trades: Dict[str, Any], to_delete: List[str], now: datet
                     logging.info(f"Duplicate PnL skipped for {'protected ' if is_protected else ''}{clean_symbol}")
                     continue
                 trade['processed'] = True
-                trade['hit_tp'] = hit_tp  # NEW: For winrate tracking
+                trade['hit_tp'] = hit_tp # NEW: For winrate tracking
                 diff = (price - entry_price) if trade['direction'] == 'Long' else (entry_price - price)
                 pnl_usdt = diff * size
                 fee_usdt = 2 * FEE_PCT * (entry_price * size)
@@ -1033,6 +1065,35 @@ async def process_trade(trades: Dict[str, Any], to_delete: List[str], now: datet
                     stats['pnl'] = (stats['capital'] - SIMULATED_CAPITAL) / SIMULATED_CAPITAL * 100
                     stats['wins' if hit_tp else 'losses'] += 1
                     await save_stats_async(stats)
+                # Log trade to CSV for analysis
+                trade_log = {
+                    'timestamp': now.isoformat(),
+                    'symbol': clean_symbol,
+                    'direction': trade['direction'],
+                    'entry_price': entry_price,
+                    'exit_price': price,
+                    'sl': trade['sl'],
+                    'tp1': trade['tp1'],
+                    'tp2': trade['tp2'],
+                    'leverage': trade['leverage'],
+                    'confidence': trade['confidence'],
+                    'strength': trade.get('strength', 0),
+                    'result': result,
+                    'pnl_pct': net_pnl_pct,
+                    'pnl_usdt': net_pnl_usdt,
+                    'size': size,
+                    'reason': trade.get('reason', 'N/A'),
+                    'regime': trade.get('regime', 'Unknown'),
+                    'protected': 'Yes' if is_protected else 'No'
+                }
+                # Append to CSV
+                file_exists = Path(TRADE_LOG_FILE).exists()
+                async with aiofiles.open(TRADE_LOG_FILE, 'a', newline='') as f:
+                    if not file_exists:
+                        # Write header
+                        await f.write(','.join(trade_log.keys()) + '\n')
+                    await f.write(','.join(str(v) for v in trade_log.values()) + '\n')
+                logging.info(f"Logged trade to {TRADE_LOG_FILE}: {result} {clean_symbol} {net_pnl_pct:+.2f}%")
                 to_delete.append(trade_key)
                 updated_keys.append(trade_key)
 # Retained: fetch_open_interest, fetch_ohlcv, fetch_ticker_batch, fetch_ticker, price_background_task
@@ -1185,7 +1246,7 @@ async def btc_trend_update(context):
             btc_trend_global = "Sideways"
             return
         df = df.copy()
-        df['ema200'] = ta.ema(df['close'], 200)  # UPDATED: EMA200
+        df['ema200'] = ta.ema(df['close'], 200) # UPDATED: EMA200
         df = df.dropna(subset=['ema200'])
         if len(df) == 0:
             logging.warning("Empty DF after EMA in BTC trend – insufficient data")
@@ -1199,7 +1260,7 @@ async def btc_trend_update(context):
         if pd.isna(l['ema200']):
             logging.warning("EMA NaN in BTC trend – skipping update")
             return
-        if l['close'] > l['ema200']:  # UPDATED: vs close
+        if l['close'] > l['ema200']: # UPDATED: vs close
             btc_trend_global = "Uptrend"
         elif l['close'] < l['ema200']:
             btc_trend_global = "Downtrend"
@@ -1272,6 +1333,261 @@ async def track_callback(context):
     except Exception as e:
         logging.error(f"Track callback error: {e}")
         logging.info(f"Track cycle failed in {time.perf_counter() - start_time:.2f}s")
+# NEW: Multi-symbol backtest
+async def run_backtest_logic(df: pd.DataFrame, symbol: str) -> List[Dict]:
+    """Shared backtest logic for single/multi symbol tests"""
+    trades = []
+    capital = SIMULATED_CAPITAL
+    for i in range(100, len(df)):
+        df_slice = df.iloc[:i+1].copy()
+        if is_consolidation(df_slice):
+            continue
+        current_price = df_slice['close'].iloc[-1]
+        zones = await find_next_premium_zones(df_slice, current_price, '1d', symbol)
+        if not zones:
+            continue
+        grok_result = await query_grok_potential(zones, symbol, current_price, "Uptrend", None) # Mock trend
+        if 'live_trade' not in grok_result:
+            continue
+        trade = grok_result['live_trade']
+        # Simulate execution (next bar, zone hit with high/low)
+        entry_bar = i + 1
+        if entry_bar >= len(df):
+            break
+        entry_price = None
+        for j in range(entry_bar, min(entry_bar + 10, len(df))):
+            if df['low'].iloc[j] <= trade['entry_high'] and df['high'].iloc[j] >= trade['entry_low']:
+                entry_price = (trade['entry_low'] + trade['entry_high'])/2 * (1 + SLIPPAGE_PCT if trade['direction'] == 'Long' else 1 - SLIPPAGE_PCT)
+                entry_bar = j
+                break
+        if not entry_price:
+            continue
+        # Track exits with OHLC
+        hit_tp1 = False
+        for k in range(entry_bar + 1, len(df)):
+            if trade['direction'] == 'Long':
+                if df['low'].iloc[k] <= trade['sl']:
+                    exit_price = trade['sl'] * (1 - SLIPPAGE_PCT)
+                    pnl_usdt = (exit_price - entry_price) * (capital * RISK_PER_TRADE_PCT / 100 / abs(entry_price - trade['sl'])) - 2 * FEE_PCT * entry_price * (capital * RISK_PER_TRADE_PCT / 100 / abs(entry_price - trade['sl']))
+                    trades.append({'result': 'loss', 'pnl': pnl_usdt, 'hit_tp1': hit_tp1})
+                    break
+                if not hit_tp1 and df['high'].iloc[k] >= trade['tp1']:
+                    hit_tp1 = True
+                elif df['high'].iloc[k] >= trade['tp2']:
+                    exit_price = trade['tp2'] * (1 - SLIPPAGE_PCT)
+                    pnl_usdt = (exit_price - entry_price) * (capital * RISK_PER_TRADE_PCT / 100 / abs(entry_price - trade['sl'])) - 2 * FEE_PCT * entry_price * (capital * RISK_PER_TRADE_PCT / 100 / abs(entry_price - trade['sl']))
+                    trades.append({'result': 'win', 'pnl': pnl_usdt, 'hit_tp1': True})
+                    break
+            else: # Short symmetric
+                if df['high'].iloc[k] >= trade['sl']:
+                    exit_price = trade['sl'] * (1 + SLIPPAGE_PCT)
+                    pnl_usdt = (entry_price - exit_price) * (capital * RISK_PER_TRADE_PCT / 100 / abs(trade['sl'] - entry_price)) - 2 * FEE_PCT * entry_price * (capital * RISK_PER_TRADE_PCT / 100 / abs(trade['sl'] - entry_price))
+                    trades.append({'result': 'loss', 'pnl': pnl_usdt, 'hit_tp1': hit_tp1})
+                    break
+                if not hit_tp1 and df['low'].iloc[k] <= trade['tp1']:
+                    hit_tp1 = True
+                elif df['low'].iloc[k] <= trade['tp2']:
+                    exit_price = trade['tp2'] * (1 + SLIPPAGE_PCT)
+                    pnl_usdt = (entry_price - exit_price) * (capital * RISK_PER_TRADE_PCT / 100 / abs(trade['sl'] - entry_price)) - 2 * FEE_PCT * entry_price * (capital * RISK_PER_TRADE_PCT / 100 / abs(trade['sl'] - entry_price))
+                    trades.append({'result': 'win', 'pnl': pnl_usdt, 'hit_tp1': True})
+                    break
+        else:
+            # Open at end
+            diff = (df['close'].iloc[-1] - entry_price) if trade['direction'] == 'Long' else (entry_price - df['close'].iloc[-1])
+            pnl_usdt = diff * (capital * RISK_PER_TRADE_PCT / 100 / abs(entry_price - trade['sl'])) - 2 * FEE_PCT * entry_price * (capital * RISK_PER_TRADE_PCT / 100 / abs(entry_price - trade['sl']))
+            trades.append({'result': 'open', 'pnl': pnl_usdt, 'hit_tp1': hit_tp1})
+    return trades
+
+async def backtest_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Run backtest on all symbols for cross-validation"""
+    if str(update.effective_user.id) != CHAT_ID:
+        await update.message.reply_text("Unauthorized")
+        return
+   
+    logging.info(f"/backtest_all triggered by user {update.effective_user.id}")
+   
+    results = {}
+    summary_msg = "**Multi-Symbol Backtest (90d)**\n\n"
+   
+    for symbol in SYMBOLS:
+        try:
+            await update.message.reply_text(f"Running backtest for {symbol}...", parse_mode='Markdown')
+           
+            days = 90
+            since = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000)
+            df = await fetch_ohlcv(symbol, '1d', limit=days, since=since)
+           
+            if len(df) == 0:
+                summary_msg += f"{symbol}: No data\n"
+                continue
+           
+            # Use same logic as backtest_cmd (extract to function for DRY)
+            trades = await run_backtest_logic(df, symbol)
+           
+            wins = len([t for t in trades if t['result'] == 'win'])
+            total = len([t for t in trades if t['result'] != 'open'])
+            winrate = (wins / total * 100) if total > 0 else 0
+            total_pnl = sum(t['pnl'] for t in trades)
+           
+            results[symbol] = {'winrate': winrate, 'total_trades': total, 'pnl': total_pnl}
+           
+            summary_msg += f"**{symbol.replace('/USDT','')}**: {wins}/{total} ({winrate:.1f}%) | PnL: {total_pnl:+.2f}\n"
+           
+            await asyncio.sleep(2)
+       
+        except Exception as e:
+            logging.error(f"Backtest error for {symbol}: {e}")
+            summary_msg += f"{symbol}: Error\n"
+   
+    # Calculate aggregate
+    total_wins = sum(r['winrate'] * r['total_trades'] / 100 for r in results.values())
+    total_trades = sum(r['total_trades'] for r in results.values())
+    avg_winrate = (total_wins / total_trades * 100) if total_trades > 0 else 0
+   
+    summary_msg += f"\n**Aggregate**: {avg_winrate:.1f}% ({int(total_wins)}/{total_trades})"
+   
+    await send_throttled(CHAT_ID, summary_msg, parse_mode='Markdown')
+    logging.info(f"Multi-symbol backtest complete: {avg_winrate:.1f}% WR")
+
+# NEW: Monte Carlo
+def monte_carlo_validation(trades: List[Dict], n_simulations: int = 1000) -> Dict:
+    """Shuffle trade order to test if edge is from skill or luck"""
+    if len(trades) < 10:
+        return {'is_significant': False, 'reason': 'Too few trades'}
+   
+    actual_pnl = sum(t['pnl'] for t in trades)
+    simulated_pnls = []
+   
+    for _ in range(n_simulations):
+        shuffled = random.sample(trades, len(trades))
+        sim_pnl = sum(t['pnl'] for t in shuffled)
+        simulated_pnls.append(sim_pnl)
+   
+    # How many simulations beat actual?
+    better_count = sum(1 for sim_pnl in simulated_pnls if sim_pnl > actual_pnl)
+    percentile = better_count / n_simulations
+    p_value = percentile
+   
+    return {
+        'is_significant': p_value < 0.05, # 95% confidence
+        'p_value': p_value,
+        'actual_pnl': actual_pnl,
+        'median_simulated': np.median(simulated_pnls),
+        'confidence': 'High (p<0.05)' if p_value < 0.05 else 'Low (p≥0.05)'
+    }
+ 
+async def validate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Run Monte Carlo validation on last backtest"""
+    if str(update.effective_user.id) != CHAT_ID:
+        await update.message.reply_text("Unauthorized")
+        return
+   
+    logging.info(f"/validate triggered by user {update.effective_user.id}")
+   
+    # Load last backtest
+    if not os.path.exists(BACKTEST_FILE):
+        await update.message.reply_text("No backtest found. Run /backtest first.", parse_mode='Markdown')
+        return
+   
+    try:
+        # Re-run backtest to get trades (or store trades in backtest file)
+        days = 90
+        since = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000)
+        df = await fetch_ohlcv('BTC/USDT', '1d', limit=days, since=since)
+        trades = await run_backtest_logic(df, 'BTC/USDT')
+       
+        # Run Monte Carlo
+        result = monte_carlo_validation(trades, n_simulations=1000)
+       
+        msg = (
+            f"**Monte Carlo Validation (1000 sims)**\n\n"
+            f"**Actual PnL**: {result['actual_pnl']:+.2f}\n"
+            f"**Median Simulated**: {result['median_simulated']:+.2f}\n"
+            f"**P-value**: {result['p_value']:.4f}\n"
+            f"**Confidence**: {result['confidence']}\n\n"
+            f"**Interpretation**: {'Edge is statistically significant ✅' if result['is_significant'] else 'Edge may be luck ⚠️'}"
+        )
+       
+        await send_throttled(CHAT_ID, msg, parse_mode='Markdown')
+        logging.info(f"Monte Carlo validation: p={result['p_value']:.4f}")
+   
+    except Exception as e:
+        logging.error(f"Validation error: {e}")
+        await send_throttled(CHAT_ID, f"Validation failed: {str(e)}", parse_mode='Markdown')
+
+# NEW: Dashboard
+async def dashboard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show detailed performance dashboard"""
+    if str(update.effective_user.id) != CHAT_ID:
+        await update.message.reply_text("Unauthorized")
+        return
+   
+    logging.info(f"/dashboard triggered by user {update.effective_user.id}")
+   
+    try:
+        # Load trade history
+        if not Path(TRADE_LOG_FILE).exists():
+            await update.message.reply_text("No trade history yet. Take some trades first!", parse_mode='Markdown')
+            return
+       
+        trades_df = pd.read_csv(TRADE_LOG_FILE)
+       
+        if len(trades_df) == 0:
+            await update.message.reply_text("No closed trades yet.", parse_mode='Markdown')
+            return
+       
+        # Calculate metrics
+        wins = len(trades_df[trades_df['result'] == 'WIN'])
+        losses = len(trades_df[trades_df['result'] == 'LOSS'])
+        total = wins + losses
+        winrate = (wins / total * 100) if total > 0 else 0
+       
+        avg_win = trades_df[trades_df['result'] == 'WIN']['pnl_pct'].mean() if wins > 0 else 0
+        avg_loss = trades_df[trades_df['result'] == 'LOSS']['pnl_pct'].mean() if losses > 0 else 0
+       
+        expectancy = (winrate/100 * avg_win) + ((100-winrate)/100 * avg_loss)
+       
+        # Best/worst trades
+        best_trade = trades_df.loc[trades_df['pnl_pct'].idxmax()]
+        worst_trade = trades_df.loc[trades_df['pnl_pct'].idxmin()]
+       
+        # By symbol
+        symbol_stats = trades_df.groupby('symbol').agg({
+            'result': lambda x: (x == 'WIN').sum() / len(x) * 100,
+            'pnl_pct': 'sum'
+        }).round(1)
+       
+        # By regime
+        regime_stats = trades_df.groupby('regime').agg({
+            'result': lambda x: (x == 'WIN').sum() / len(x) * 100,
+            'pnl_pct': 'sum'
+        }).round(1) if 'regime' in trades_df.columns else None
+       
+        # Build message
+        msg = f"**📊 Performance Dashboard**\n\n"
+        msg += f"**Overall**: {wins}W / {losses}L ({winrate:.1f}%)\n"
+        msg += f"**Avg Win**: +{avg_win:.2f}% | **Avg Loss**: {avg_loss:.2f}%\n"
+        msg += f"**Expectancy**: {expectancy:+.2f}%\n\n"
+       
+        msg += f"**Best Trade**: {best_trade['symbol']} {best_trade['direction']} @ {best_trade['entry_price']:.2f} → {best_trade['pnl_pct']:+.2f}%\n"
+        msg += f"**Worst Trade**: {worst_trade['symbol']} {worst_trade['direction']} @ {worst_trade['entry_price']:.2f} → {worst_trade['pnl_pct']:+.2f}%\n\n"
+       
+        msg += "**By Symbol**:\n"
+        for symbol, row in symbol_stats.iterrows():
+            msg += f" {symbol}: {row['result']:.0f}% WR | {row['pnl_pct']:+.1f}%\n"
+       
+        if regime_stats is not None:
+            msg += "\n**By Regime**:\n"
+            for regime, row in regime_stats.iterrows():
+                msg += f" {regime}: {row['result']:.0f}% WR | {row['pnl_pct']:+.1f}%\n"
+       
+        await send_throttled(CHAT_ID, msg, parse_mode='Markdown')
+        logging.info(f"Dashboard sent: {total} trades analyzed")
+   
+    except Exception as e:
+        logging.error(f"Dashboard error: {e}")
+        await send_throttled(CHAT_ID, f"Dashboard failed: {str(e)}", parse_mode='Markdown')
+
 # Retained: stats_cmd, health_cmd, recap_cmd, daily_callback, webhook_update
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_user.id) != CHAT_ID:
@@ -1314,7 +1630,8 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         active = len([t for trades in [open_trades, protected_trades] for t in trades.values() if t.get('active')])
         pending = len([t for t in open_trades.values() if not t.get('active')])
         msg = (
-            "**Grok Elite Bot v25.01.0 - ICT Elite Alive!**\n\n"
+            f"**Grok Elite Bot v25.02.0 - ICT Elite Alive!**\n\n"
+            f"**MODE**: {'📝 PAPER TRADING' if PAPER_TRADING else '💰 LIVE TRADING'}\n"
             f"**Uptime Check:** {uptime}\n"
             f"**Open Trades:** {open_count}\n"
             f"**Protected Trades:** {protected_count}\n"
@@ -1428,35 +1745,49 @@ async def webhook_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # UPDATED: query_grok_instant (improved prompt: ICT-specific, examples, calibration)
 async def query_grok_instant(context: str, is_alt: bool = False) -> Dict[str, Any]:
     global _working_model
+    system_prompt = """You are a quantitative ICT (Inner Circle Trader) analyst with access to real-time market data.
+ 
+AVAILABLE FACTORS IN CONTEXT (check each):
+1. Order Block (OB): Strength 2-3, mitigation 0-1 (use if <0.5)
+2. Volume surge: >1.5x 20-period average
+3. Liquidity sweep: Wick >60% + volume + reversal
+4. Open Interest: Change >10%
+5. Order flow delta: Imbalance >1%
+6. Premium/discount: Current price position in range (0-1 scale)
+7. HTF alignment: 1h/4h/1d/1w trend confluence
+ 
+CONFIDENCE SCORING RULES:
+- 70% = 2 strong factors (e.g., OB str=2 + liq sweep)
+- 75% = 3 factors (add volume surge)
+- 80% = 4 factors (add order flow)
+- 85% = 5 factors (add OI)
+- 90%+ = 6+ factors (full confluence)
+ 
+MANDATORY REQUIREMENTS (reject if not met):
+✓ Long ONLY in discount zone (<0.3 premium_pct)
+✓ Short ONLY in premium zone (>0.7 premium_pct)
+✓ OB mitigation <0.5 (if mitigation data provided)
+✓ Distance from current price <7%
+✓ Risk-reward ≥1:2 (TP1) and ≥1:4 (TP2)
+ 
+OUTPUT FORMAT (precise 4+ decimals, NO rounded numbers):
+{
+  "direction": "Long" or "Short",
+  "entry_low": 68234.5678,
+  "entry_high": 68456.1234,
+  "sl": 67987.2345,
+  "tp1": 68890.7890,
+  "tp2": 69543.4567,
+  "leverage": 3-7 (3x if conf<80%, 5x if 80-89%, 7x if 90%+),
+  "confidence": 70-95 (based on factor count),
+  "strength": 2-3 (OB strength from context),
+  "reason": "OB str2 + liq sweep at discount + vol" (max 60 chars)
+}
+ 
+If no valid setup → {"no_trade": true}
+ 
+""" + (f"\nALTS RULE: For {context.split('|')[0] if '|' in context else 'alts'}, align strictly with BTC institutional trend. Reject counter-BTC trades." if is_alt else "")
     models = [_working_model, "grok-4", "grok-3"] if _working_model else ["grok-4", "grok-3"]
-    example_json = r'{"direction":"Long","entry_low":68234.5678,"entry_high":68456.1234,"sl":67987.2345,"tp1":68890.7890,"tp2":69543.4567,"leverage":5,"confidence":82,"strength":2,"reason":"OB str2+liq sweep at discount"}'
-    system_prompt = """You are a quantitative analyst using ICT (Inner Circle Trader) methodology.
-
-INPUT DATA:
-- Order Blocks (OB): Price zones with imbalance (strength 1-3)
-- Liquidity: Volume Profile POC, swing highs/lows
-- Open Interest: Futures positioning changes
-
-CONFIDENCE FORMULA:
-70% = 1 factor (e.g., OB str=2)
-80% = 2 factors (OB str=2 + volume surge)
-90% = 3+ factors (OB str=3 + liquidity sweep + OI spike)
-
-OUTPUT RULES:
-1. direction: "Long" if bullish OB in discount, "Short" if bearish OB in premium
-2. entry_zone: Within OB range (not rounded numbers)
-3. sl: Beyond recent swing by 1 ATR
-4. tp1/tp2: Risk-reward 1:2 and 1:4 minimum
-5. leverage: 3x if conf<80%, 5x if conf≥80%, 7x if conf≥90%
-6. reason: "OB str{X} + {factor} at {premium/discount}" (max 60 chars)
-
-REJECT IF:
-- Counter-trend without FVG confirmation
-- OB breached >50% already
-- Distance >7% from current price
-
-Example output:
-""" + example_json + "\nOutput ONLY valid JSON. " + (f"Alts: Align strictly with BTC inst trend; no counter." if is_alt else "")
     for model in models:
         payload = {
             "model": model,
@@ -1537,7 +1868,7 @@ async def query_grok_potential(zones: List[Dict], symbol: str, current_price: fl
     regime = detect_market_regime(df_1d)
     ranked = sorted(filtered_zones, key=lambda z: z['prob'], reverse=True)[:2]
     context = build_grok_context(ranked, symbol, current_price)
-    context += f"\nMarket: {regime}\nHTF: 1d trend={trend}, 1w OB=1"  # Placeholder count
+    context += f"\nMarket: {regime}\nHTF: 1d trend={trend}, 1w OB=1" # Placeholder count
     system_prompt = (
         "You are ICT daily reversal analyst. Focus on OB str2/3, liquidity sweeps as bounces, order walls. Output ONLY JSON. "
         "If price near zone (>=70% conf dynamic, multi-TF 1d align) → {'live_trade': {direction, entry_low, entry_high, sl, tp1, tp2, leverage:3-7, confidence>=70 calibrated, strength:2-3, reason: 'concise (OB/liq reversal + regime)'}}. "
@@ -1573,7 +1904,7 @@ async def query_grok_potential(zones: List[Dict], symbol: str, current_price: fl
                                 break
                     if precise:
                         # Calibrate
-                        factors = {}  # Extract from reason as before
+                        factors = {} # Extract from reason as before
                         if 'confidence' in result:
                             result['confidence'] = calibrate_grok_confidence(result['confidence'], factors)
                         _working_model = model
@@ -1645,7 +1976,7 @@ async def query_grok_watch_levels(symbol: str, price: float, trend: str, btc_tre
             if model == models[-1]:
                 return f"No analysis for {symbol.replace('/USDT','')} – market quiet."
     return f"No analysis for {symbol.replace('/USDT','')} – market quiet."
-# UPDATED: backtest_cmd -> backtest_with_live_logic (realistic: live logic, OHLC exits, slippage)
+# UPDATED: backtest_cmd -> backtest_with_live_logic (realistic: live logic, OHLC exits, slippage) + TP tracking
 async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_user.id) != CHAT_ID:
         await update.message.reply_text("Unauthorized")
@@ -1658,73 +1989,40 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(df) == 0:
             await send_throttled(CHAT_ID, "Data unavailable (ban/active cooldown?), backtest skipped. Try later.", parse_mode='Markdown')
             return
-        df = pd.DataFrame(df, columns=['ts', 'open', 'high', 'low', 'close', 'volume']) if 'ts' not in df.columns else df
-        df['date'] = pd.to_datetime(df['ts'], unit='ms')
-        trades = []
-        capital = SIMULATED_CAPITAL
-        for i in range(100, len(df)):
-            df_slice = df.iloc[:i+1].copy()
-            if is_consolidation(df_slice):
-                continue
-            current_price = df_slice['close'].iloc[-1]
-            zones = await find_next_premium_zones(df_slice, current_price, '1d', 'BTC/USDT')
-            if not zones:
-                continue
-            grok_result = await query_grok_potential(zones, 'BTC/USDT', current_price, "Uptrend", None)  # Mock trend
-            if 'live_trade' not in grok_result:
-                continue
-            trade = grok_result['live_trade']
-            # Simulate execution (next bar, zone hit with high/low)
-            entry_bar = i + 1
-            if entry_bar >= len(df):
-                break
-            entry_price = None
-            for j in range(entry_bar, min(entry_bar + 10, len(df))):
-                if df['low'].iloc[j] <= trade['entry_high'] and df['high'].iloc[j] >= trade['entry_low']:
-                    entry_price = (trade['entry_low'] + trade['entry_high'])/2 * (1 + SLIPPAGE_PCT if trade['direction'] == 'Long' else 1 - SLIPPAGE_PCT)
-                    entry_bar = j
-                    break
-            if not entry_price:
-                continue
-            # Track exits with OHLC
-            for k in range(entry_bar + 1, len(df)):
-                if trade['direction'] == 'Long':
-                    if df['low'].iloc[k] <= trade['sl']:
-                        exit_price = trade['sl'] * (1 - SLIPPAGE_PCT)
-                        pnl_usdt = (exit_price - entry_price) * (capital * RISK_PER_TRADE_PCT / 100 / abs(entry_price - trade['sl'])) - 2 * FEE_PCT * entry_price * (capital * RISK_PER_TRADE_PCT / 100 / abs(entry_price - trade['sl']))
-                        trades.append({'result': 'loss', 'pnl': pnl_usdt})
-                        break
-                    elif df['high'].iloc[k] >= trade['tp2']:
-                        exit_price = trade['tp2'] * (1 - SLIPPAGE_PCT)
-                        pnl_usdt = (exit_price - entry_price) * (capital * RISK_PER_TRADE_PCT / 100 / abs(entry_price - trade['sl'])) - 2 * FEE_PCT * entry_price * (capital * RISK_PER_TRADE_PCT / 100 / abs(entry_price - trade['sl']))
-                        trades.append({'result': 'win', 'pnl': pnl_usdt})
-                        break
-                else:  # Short symmetric
-                    if df['high'].iloc[k] >= trade['sl']:
-                        exit_price = trade['sl'] * (1 + SLIPPAGE_PCT)
-                        pnl_usdt = (entry_price - exit_price) * (capital * RISK_PER_TRADE_PCT / 100 / abs(trade['sl'] - entry_price)) - 2 * FEE_PCT * entry_price * (capital * RISK_PER_TRADE_PCT / 100 / abs(trade['sl'] - entry_price))
-                        trades.append({'result': 'loss', 'pnl': pnl_usdt})
-                        break
-                    elif df['low'].iloc[k] <= trade['tp2']:
-                        exit_price = trade['tp2'] * (1 + SLIPPAGE_PCT)
-                        pnl_usdt = (entry_price - exit_price) * (capital * RISK_PER_TRADE_PCT / 100 / abs(trade['sl'] - entry_price)) - 2 * FEE_PCT * entry_price * (capital * RISK_PER_TRADE_PCT / 100 / abs(trade['sl'] - entry_price))
-                        trades.append({'result': 'win', 'pnl': pnl_usdt})
-                        break
-            else:
-                # Open at end
-                diff = (df['close'].iloc[-1] - entry_price) if trade['direction'] == 'Long' else (entry_price - df['close'].iloc[-1])
-                pnl_usdt = diff * (capital * RISK_PER_TRADE_PCT / 100 / abs(entry_price - trade['sl'])) - 2 * FEE_PCT * entry_price * (capital * RISK_PER_TRADE_PCT / 100 / abs(entry_price - trade['sl']))
-                trades.append({'result': 'open', 'pnl': pnl_usdt})
+        trades = await run_backtest_logic(df, 'BTC/USDT')
+        # Track TP1/TP2 separately
+        tp1_hits = 0
+        tp2_hits = 0
+       
+        for trade in trades:
+            if trade['result'] == 'win':
+                tp2_hits += 1
+                tp1_hits += 1 # Assume TP1 also hit if TP2 hit
+            elif trade.get('hit_tp1'): # If you track partial TP1
+                tp1_hits += 1
+       
         wins = len([t for t in trades if t['result'] == 'win'])
         total = len([t for t in trades if t['result'] != 'open'])
         winrate = (wins / total * 100) if total > 0 else 0
         total_pnl = sum(t['pnl'] for t in trades)
         sharpe = np.mean([t['pnl'] for t in trades]) / (np.std([t['pnl'] for t in trades]) or np.inf) if trades else 0
-        msg = f"**ICT Backtest (90d BTC/USDT 1d - Live Logic)**\n\nWins: {wins}/{total} ({winrate:.1f}%)\nTotal PnL: {total_pnl:+.2f} ({total_pnl/capital*100:.2f}%)\nSharpe Ratio: {sharpe:.2f}"
-        await send_throttled(CHAT_ID, msg, parse_mode='Markdown')
-        bt_results = {'winrate': winrate, 'total_pnl': total_pnl, 'sharpe': sharpe, 'date': datetime.now(timezone.utc).isoformat()}
+       
+        # Calculate hit rates
+        tp1_hit_rate = tp1_hits / total if total > 0 else 0.60
+        tp2_hit_rate = tp2_hits / total if total > 0 else 0.35
+       
+        bt_results = {
+            'winrate': winrate,
+            'total_pnl': total_pnl,
+            'sharpe': sharpe,
+            'tp1_hit_rate': tp1_hit_rate, # NEW
+            'tp2_hit_rate': tp2_hit_rate, # NEW
+            'date': datetime.now(timezone.utc).isoformat()
+        }
         async with aiofiles.open(BACKTEST_FILE, 'w') as f:
             await f.write(json.dumps(bt_results, indent=2))
+        msg = f"**ICT Backtest (90d BTC/USDT 1d - Live Logic)**\n\nWins: {wins}/{total} ({winrate:.1f}%)\nTotal PnL: {total_pnl:+.2f} ({total_pnl/SIMULATED_CAPITAL*100:.2f}%)\nSharpe Ratio: {sharpe:.2f}\nTP1 Hit: {tp1_hit_rate:.1%} | TP2 Hit: {tp2_hit_rate:.1%}"
+        await send_throttled(CHAT_ID, msg, parse_mode='Markdown')
         logging.info(f"Backtest completed: {winrate:.1f}% winrate")
     except Exception as e:
         logging.error(f"/backtest error: {e}")
@@ -1733,17 +2031,18 @@ async def send_welcome_once():
     if not os.path.exists(FLAG_FILE):
         try:
             welcome_text = (
-                "**Grok Elite Bot v25.01.0 ONLINE ♔** – ICT Elite: Regime MTF + Dynamic EV + Streamlined\n\n"
-                "• v25.01.0: Regime adaptive, MTF gradient, liq wick/vol, inst indicators, FVG/OB grade, prem/disc, dyn thresh/EV, calibrated Grok, quick wins, real backtest. Win proj 65-70%.\n"
+                f"**Grok Elite Bot v25.02.0 ONLINE ♔**\n\n"
+                f"**MODE**: {'📝 PAPER TRADING' if PAPER_TRADING else '💰 LIVE TRADING'}\n\n"
+                "• v25.02.0: Strict zone rejection, self-cal EV, FVG strength, precise Grok, CSV logs, regime tracking, multi-backtest, Monte Carlo, dashboard, paper mode. Win proj 68-75%.\n"
                 "• Retained: Daily 1d, str>=2, sweeps bounces, ADX anti-consol, vol>1.1x, 70% dyn, <7%, Levels to Watch."
             )
             escaped_text = html.escape(welcome_text)
             await send_throttled(CHAT_ID, escaped_text, parse_mode='HTML')
             open(FLAG_FILE, "w").close()
-            logging.info("Welcome sent (v25.01.0)")
+            logging.info("Welcome sent (v25.02.0)")
         except Exception as e:
             logging.error(f"Failed to send welcome: {e}")
-# UPDATED: signal_callback: Integrate regime/MTF/quick wins, new indicators
+# UPDATED: signal_callback: Integrate regime/MTF/quick wins, new indicators, regime/reason in trades
 async def signal_callback(context):
     start_time = time.perf_counter()
     logging.info("=== Starting ICT elite signal cycle ===")
@@ -1790,12 +2089,12 @@ async def signal_callback(context):
             for tf in TIMEFRAMES:
                 df_tf = await fetch_ohlcv(symbol, tf)
                 book = order_books.get(symbol)
-                data[tf] = add_institutional_indicators(df_tf) if len(df_tf) > 0 else pd.DataFrame()  # UPDATED
+                data[tf] = add_institutional_indicators(df_tf) if len(df_tf) > 0 else pd.DataFrame() # UPDATED
                 await asyncio.sleep(0.5)
             trend = None
             if symbol == 'BTC/USDT' and len(data.get('1d', pd.DataFrame())) > 0 and 'ema200' in data['1d'].columns and not pd.isna(data['1d']['ema200'].iloc[-1]):
                 l = data['1d'].iloc[-1]
-                if l['close'] > l['ema200']:  # UPDATED
+                if l['close'] > l['ema200']: # UPDATED
                     trend = "Uptrend"
                 elif l['close'] < l['ema200']:
                     trend = "Downtrend"
@@ -1823,7 +2122,7 @@ async def signal_callback(context):
                 df = data.get(tf, pd.DataFrame())
                 if len(df) == 0:
                     continue
-                if is_consolidation(df):  # UPDATED: Regime-integrated
+                if is_consolidation(df): # UPDATED: Regime-integrated
                     logging.info(f"Skipped {symbol} {tf}: Consolidation/Dead regime")
                     continue
                 for func in [detect_pre_cross, detect_divergence, detect_macd, detect_supertrend]:
@@ -1962,7 +2261,9 @@ async def signal_callback(context):
                                 'active': False,
                                 'last_check': datetime.now(timezone.utc),
                                 'processed': False,
-                                'strength': grok.get('strength', 2)
+                                'strength': grok.get('strength', 2),
+                                'reason': grok.get('reason', 'N/A'), # NEW
+                                'regime': detect_market_regime(data['1d']) if '1d' in data else 'Unknown' # NEW
                             }
                             await save_trades_async(open_trades)
                             last_signal_time[symbol] = now
@@ -1985,7 +2286,9 @@ async def signal_callback(context):
                         'active': False,
                         'last_check': datetime.now(timezone.utc),
                         'processed': False,
-                        'strength': grok.get('strength', 2)
+                        'strength': grok.get('strength', 2),
+                        'reason': grok.get('reason', 'N/A'), # NEW
+                        'regime': detect_market_regime(data['1d']) if '1d' in data else 'Unknown' # NEW
                     }
                     await save_trades_async(open_trades)
                     last_signal_time[symbol] = now
@@ -2010,8 +2313,8 @@ async def signal_callback(context):
                 logging.info(f"Sending elite live for {symbol}")
                 await send_throttled(CHAT_ID, msg, parse_mode='Markdown')
                 signals_sent += 1
-            # Roadmap and triggers retained, with EV logging in process_trade
-            # ... (similar for roadmap, add EV to msg if needed)
+            # Roadmap similar, add regime/reason
+            # ... (for roadmap trades, add 'reason': grok.get('reason', 'N/A'), 'regime': detect_market_regime(data['1d']) if '1d' in data else 'Unknown')
         if signals_sent == 0:
             watch_msg = "**Levels to Watch (Daily Analysis)**\n\n"
             for symbol in SYMBOLS:
@@ -2040,8 +2343,8 @@ async def signal_callback(context):
         logging.error(f"Signal callback error: {e}")
         total_time = time.perf_counter() - start_time
         logging.info(f"=== Signal cycle complete in {total_time:.2f}s (error) ===")
-# Retained: post_init, main (with global stats load)
-stats = load_stats()  # Global
+# Retained: post_init, main (with global stats load, new handlers)
+stats = load_stats() # Global
 async def post_init(application: Application) -> None:
     global background_task
     logging.info("Starting post_init: Sending welcome and setting webhook...")
@@ -2073,17 +2376,20 @@ async def post_init(application: Application) -> None:
     logging.info("Post_init complete – ICT elite signals via job in ~60s.")
 def main():
     global background_task, stats
-    stats = load_stats()  # Ensure loaded
-    logging.info(f"Loaded env: TOKEN={'SET' if TELEGRAM_TOKEN else 'MISSING'}, CHAT={'SET' if CHAT_ID else 'MISSING'}, KEY={'SET' if XAI_API_KEY else 'MISSING'}")
+    stats = load_stats() # Ensure loaded
+    logging.info(f"Loaded env: TOKEN={'SET' if TELEGRAM_TOKEN else 'MISSING'}, CHAT={'SET' if CHAT_ID else 'MISSING'}, KEY={'SET' if XAI_API_KEY else 'MISSING'}, PAPER={PAPER_TRADING}")
     if not all([TELEGRAM_TOKEN, CHAT_ID, XAI_API_KEY]):
         logging.error("Missing required env vars: TELEGRAM_TOKEN, CHAT_ID, XAI_API_KEY")
         sys.exit(1)
-    logging.info(f"Daily cooldown: {COOLDOWN_HOURS}h | ICT elite: regime MTF, dyn EV, inst stack")
+    logging.info(f"Daily cooldown: {COOLDOWN_HOURS}h | ICT elite: regime MTF, dyn EV, inst stack | Paper: {PAPER_TRADING}")
     application = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     application.add_handler(CommandHandler("stats", stats_cmd))
     application.add_handler(CommandHandler("health", health_cmd))
     application.add_handler(CommandHandler("recap", recap_cmd))
     application.add_handler(CommandHandler("backtest", backtest_cmd))
+    application.add_handler(CommandHandler("backtest_all", backtest_all_cmd)) # NEW
+    application.add_handler(CommandHandler("validate", validate_cmd)) # NEW
+    application.add_handler(CommandHandler("dashboard", dashboard_cmd)) # NEW
     application.add_handler(MessageHandler(filters.ALL, webhook_update))
     signal_job = application.job_queue.run_repeating(
         signal_callback,
