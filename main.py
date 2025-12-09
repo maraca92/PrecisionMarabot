@@ -699,12 +699,26 @@ def add_indicators(df: pd.DataFrame, order_book: Optional[Dict] = None) -> pd.Da
         if stoch is not None and len(stoch.columns) >= 2:
             df['stoch_k'] = stoch.iloc[:, 0]
             df['stoch_d'] = stoch.iloc[:, 1]
-        df['vwap'] = ta.vwap(df['high'], df['low'], df['close'], df['volume'])
-        # NEW FIX: Log VWAP NaNs for monitoring
+        # FIXED VWAP: Use DatetimeIndex for reliable computation; check volume to avoid full NaNs
+        if 'date' in df.columns:
+            df_temp = df.set_index('date').sort_index()  # Ensure chronological DatetimeIndex
+            total_vol = df_temp['volume'].sum()
+            if total_vol > 0:
+                vwap_series = ta.vwap(df_temp['high'], df_temp['low'], df_temp['close'], df_temp['volume'])
+                df['vwap'] = vwap_series.values  # Assign values (order preserved)
+                logging.debug(f"VWAP computed successfully (total vol: {total_vol:.0f})")
+            else:
+                df['vwap'] = np.nan
+                logging.warning(f"VWAP skipped for df len {len(df)}: total volume=0")
+        else:
+            # Fallback if no 'date' column
+            df['vwap'] = np.nan
+            logging.warning(f"VWAP skipped: no 'date' column in df len {len(df)}")
+        # Log NaNs only if unexpected (post-computation check)
         if 'vwap' in df.columns:
             nan_count = df['vwap'].isna().sum()
-            if nan_count > 0:
-                logging.warning(f"VWAP has {nan_count} NaNs in df of len {len(df)}")
+            if nan_count > len(df) * 0.5:  # Warn only if >50% NaNs (e.g., not just early rows)
+                logging.warning(f"VWAP has {nan_count} NaNs in df of len {len(df)} (possible data issue)")
     # Order Flow: Calculate delta/footprint/sweep
     df = calculate_order_flow(df, order_book)
     key_cols = ['ema50', 'ema100', 'rsi', 'volume_sma', 'macd', 'macd_signal', 'supertrend_dir', 'vwap', 'ema200', 'order_delta', 'cum_delta', 'liq_sweep'] # NEW: + liq_sweep
