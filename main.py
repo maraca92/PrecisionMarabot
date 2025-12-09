@@ -27,7 +27,6 @@ import zoneinfo # For timezone-aware time-of-day filter
 import csv
 from pathlib import Path
 import random
-
 SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
 TIMEFRAMES = ['1h', '4h', '1d', '1w'] # UPDATED: Added 1h for MTF cascade
 CHECK_INTERVAL = 7200 # 2h for more checks
@@ -76,7 +75,6 @@ MAX_DRAWDOWN_PCT = 3.0
 RISK_PER_TRADE_PCT = 1.5
 DAILY_ATR_MULT = 2.0
 SIMULATED_CAPITAL = 10000.0
-
 def load_historical_data() -> Dict[str, float]:
     """Load TP hit rates from backtest results or use defaults"""
     if os.path.exists(BACKTEST_FILE):
@@ -90,9 +88,7 @@ def load_historical_data() -> Dict[str, float]:
         except Exception as e:
             logging.warning(f"Failed to load historical data: {e}")
     return {'tp1_hit_rate': 0.60, 'tp2_hit_rate': 0.35}
-
 HISTORICAL_DATA = load_historical_data()
-
 ohlcv_cache: OrderedDict = OrderedDict()
 ticker_cache: OrderedDict = OrderedDict()
 order_flow_cache: OrderedDict = OrderedDict()
@@ -1155,20 +1151,14 @@ async def fetch_ohlcv(symbol: str, tf: str, limit: int = 200, since: Optional[in
                 if since:
                     params['since'] = since
                 data = await exchange.fetch_ohlcv(symbol, norm_tf, **params)
+                # Create DataFrame
                 df = pd.DataFrame(data, columns=['ts', 'open', 'high', 'low', 'close', 'volume'])
                 df['date'] = pd.to_datetime(df['ts'], unit='ms')
-                df_indexed = df.set_index('date').sort_index()
-                total_vol = df_indexed['volume'].sum()
-                if total_vol > 0:
-                    vwap_series = ta.vwap(df_indexed['high'], df_indexed['low'],
-                                          df_indexed['close'], df_indexed['volume'])
-                    df = df.set_index('date')
-                    df['vwap'] = vwap_series
-                    df = df.reset_index()
-                    logging.debug(f"VWAP computed successfully (total vol: {total_vol:.0f})")
-                else:
-                    df['vwap'] = np.nan
-                    logging.warning(f"VWAP skipped for df len {len(df)}: total volume=0")
+               
+                # Compute VWAP in isolated function
+                df = compute_vwap_safe(df)
+               
+                # Store in cache
                 ohlcv_cache[cache_key] = {'df': df, 'timestamp': now}
                 success = True
                 logging.info(f"OHLCV fetched for {symbol} {tf} (attempt {attempt+1})")
@@ -1184,6 +1174,51 @@ async def fetch_ohlcv(symbol: str, tf: str, limit: int = 200, since: Optional[in
         sleep_time = 3 if success else 5
         await asyncio.sleep(sleep_time)
         return cache_get(ohlcv_cache, cache_key).get('df', pd.DataFrame()) if cache_get(ohlcv_cache, cache_key) else pd.DataFrame()
+
+def compute_vwap_safe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute VWAP safely with proper DatetimeIndex handling.
+    Returns DataFrame with 'vwap' column added.
+    """
+    if len(df) < 20 or 'date' not in df.columns:
+        df['vwap'] = np.nan
+        return df
+   
+    try:
+        # Create a COPY with DatetimeIndex for VWAP calculation
+        df_indexed = df.set_index('date').sort_index().copy()
+       
+        # Check volume
+        total_vol = df_indexed['volume'].sum()
+        if total_vol == 0:
+            df['vwap'] = np.nan
+            logging.debug("VWAP skipped: zero volume")
+            return df
+       
+        # Compute VWAP on indexed copy
+        vwap_series = ta.vwap(
+            df_indexed['high'],
+            df_indexed['low'],
+            df_indexed['close'],
+            df_indexed['volume']
+        )
+       
+        # Assign back to original DataFrame by matching dates
+        # Create a mapping from date to vwap value
+        vwap_dict = vwap_series.to_dict()
+        df['vwap'] = df['date'].map(vwap_dict)
+       
+        # Log success
+        nan_count = df['vwap'].isna().sum()
+        logging.debug(f"VWAP computed: {len(df)} bars, {nan_count} NaN")
+       
+        return df
+       
+    except Exception as e:
+        logging.warning(f"VWAP computation failed: {e}")
+        df['vwap'] = np.nan
+        return df
+
 async def fetch_ticker_batch() -> Dict[str, Optional[float]]:
     async with fetch_sem:
         now = time.time()
@@ -1397,77 +1432,75 @@ async def run_backtest_logic(df: pd.DataFrame, symbol: str) -> List[Dict]:
             pnl_usdt = diff * (capital * RISK_PER_TRADE_PCT / 100 / abs(entry_price - trade['sl'])) - 2 * FEE_PCT * entry_price * (capital * RISK_PER_TRADE_PCT / 100 / abs(entry_price - trade['sl']))
             trades.append({'result': 'open', 'pnl': pnl_usdt, 'hit_tp1': hit_tp1})
     return trades
-
 async def backtest_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Run backtest on all symbols for cross-validation"""
     if str(update.effective_user.id) != CHAT_ID:
         await update.message.reply_text("Unauthorized")
         return
-   
+  
     logging.info(f"/backtest_all triggered by user {update.effective_user.id}")
-   
+  
     results = {}
     summary_msg = "**Multi-Symbol Backtest (90d)**\n\n"
-   
+  
     for symbol in SYMBOLS:
         try:
             await update.message.reply_text(f"Running backtest for {symbol}...", parse_mode='Markdown')
-           
+          
             days = 90
             since = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000)
             df = await fetch_ohlcv(symbol, '1d', limit=days, since=since)
-           
+          
             if len(df) == 0:
                 summary_msg += f"{symbol}: No data\n"
                 continue
-           
+          
             # Use same logic as backtest_cmd (extract to function for DRY)
             trades = await run_backtest_logic(df, symbol)
-           
+          
             wins = len([t for t in trades if t['result'] == 'win'])
             total = len([t for t in trades if t['result'] != 'open'])
             winrate = (wins / total * 100) if total > 0 else 0
             total_pnl = sum(t['pnl'] for t in trades)
-           
+          
             results[symbol] = {'winrate': winrate, 'total_trades': total, 'pnl': total_pnl}
-           
+          
             summary_msg += f"**{symbol.replace('/USDT','')}**: {wins}/{total} ({winrate:.1f}%) | PnL: {total_pnl:+.2f}\n"
-           
+          
             await asyncio.sleep(2)
-       
+      
         except Exception as e:
             logging.error(f"Backtest error for {symbol}: {e}")
             summary_msg += f"{symbol}: Error\n"
-   
+  
     # Calculate aggregate
     total_wins = sum(r['winrate'] * r['total_trades'] / 100 for r in results.values())
     total_trades = sum(r['total_trades'] for r in results.values())
     avg_winrate = (total_wins / total_trades * 100) if total_trades > 0 else 0
-   
+  
     summary_msg += f"\n**Aggregate**: {avg_winrate:.1f}% ({int(total_wins)}/{total_trades})"
-   
+  
     await send_throttled(CHAT_ID, summary_msg, parse_mode='Markdown')
     logging.info(f"Multi-symbol backtest complete: {avg_winrate:.1f}% WR")
-
 # NEW: Monte Carlo
 def monte_carlo_validation(trades: List[Dict], n_simulations: int = 1000) -> Dict:
     """Shuffle trade order to test if edge is from skill or luck"""
     if len(trades) < 10:
         return {'is_significant': False, 'reason': 'Too few trades'}
-   
+  
     actual_pnl = sum(t['pnl'] for t in trades)
     simulated_pnls = []
-   
+  
     for _ in range(n_simulations):
         shuffled = random.sample(trades, len(trades))
         sim_pnl = sum(t['pnl'] for t in shuffled)
         simulated_pnls.append(sim_pnl)
-   
+  
     # How many simulations beat actual?
     better_count = sum(1 for sim_pnl in simulated_pnls if sim_pnl > actual_pnl)
     percentile = better_count / n_simulations
     p_value = percentile
-   
+  
     return {
         'is_significant': p_value < 0.05, # 95% confidence
         'p_value': p_value,
@@ -1475,30 +1508,29 @@ def monte_carlo_validation(trades: List[Dict], n_simulations: int = 1000) -> Dic
         'median_simulated': np.median(simulated_pnls),
         'confidence': 'High (p<0.05)' if p_value < 0.05 else 'Low (p≥0.05)'
     }
- 
 async def validate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Run Monte Carlo validation on last backtest"""
     if str(update.effective_user.id) != CHAT_ID:
         await update.message.reply_text("Unauthorized")
         return
-   
+  
     logging.info(f"/validate triggered by user {update.effective_user.id}")
-   
+  
     # Load last backtest
     if not os.path.exists(BACKTEST_FILE):
         await update.message.reply_text("No backtest found. Run /backtest first.", parse_mode='Markdown')
         return
-   
+  
     try:
         # Re-run backtest to get trades (or store trades in backtest file)
         days = 90
         since = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000)
         df = await fetch_ohlcv('BTC/USDT', '1d', limit=days, since=since)
         trades = await run_backtest_logic(df, 'BTC/USDT')
-       
+      
         # Run Monte Carlo
         result = monte_carlo_validation(trades, n_simulations=1000)
-       
+      
         msg = (
             f"**Monte Carlo Validation (1000 sims)**\n\n"
             f"**Actual PnL**: {result['actual_pnl']:+.2f}\n"
@@ -1507,87 +1539,85 @@ async def validate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"**Confidence**: {result['confidence']}\n\n"
             f"**Interpretation**: {'Edge is statistically significant ✅' if result['is_significant'] else 'Edge may be luck ⚠️'}"
         )
-       
+      
         await send_throttled(CHAT_ID, msg, parse_mode='Markdown')
         logging.info(f"Monte Carlo validation: p={result['p_value']:.4f}")
-   
+  
     except Exception as e:
         logging.error(f"Validation error: {e}")
         await send_throttled(CHAT_ID, f"Validation failed: {str(e)}", parse_mode='Markdown')
-
 # NEW: Dashboard
 async def dashboard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show detailed performance dashboard"""
     if str(update.effective_user.id) != CHAT_ID:
         await update.message.reply_text("Unauthorized")
         return
-   
+  
     logging.info(f"/dashboard triggered by user {update.effective_user.id}")
-   
+  
     try:
         # Load trade history
         if not Path(TRADE_LOG_FILE).exists():
             await update.message.reply_text("No trade history yet. Take some trades first!", parse_mode='Markdown')
             return
-       
+      
         trades_df = pd.read_csv(TRADE_LOG_FILE)
-       
+      
         if len(trades_df) == 0:
             await update.message.reply_text("No closed trades yet.", parse_mode='Markdown')
             return
-       
+      
         # Calculate metrics
         wins = len(trades_df[trades_df['result'] == 'WIN'])
         losses = len(trades_df[trades_df['result'] == 'LOSS'])
         total = wins + losses
         winrate = (wins / total * 100) if total > 0 else 0
-       
+      
         avg_win = trades_df[trades_df['result'] == 'WIN']['pnl_pct'].mean() if wins > 0 else 0
         avg_loss = trades_df[trades_df['result'] == 'LOSS']['pnl_pct'].mean() if losses > 0 else 0
-       
+      
         expectancy = (winrate/100 * avg_win) + ((100-winrate)/100 * avg_loss)
-       
+      
         # Best/worst trades
         best_trade = trades_df.loc[trades_df['pnl_pct'].idxmax()]
         worst_trade = trades_df.loc[trades_df['pnl_pct'].idxmin()]
-       
+      
         # By symbol
         symbol_stats = trades_df.groupby('symbol').agg({
             'result': lambda x: (x == 'WIN').sum() / len(x) * 100,
             'pnl_pct': 'sum'
         }).round(1)
-       
+      
         # By regime
         regime_stats = trades_df.groupby('regime').agg({
             'result': lambda x: (x == 'WIN').sum() / len(x) * 100,
             'pnl_pct': 'sum'
         }).round(1) if 'regime' in trades_df.columns else None
-       
+      
         # Build message
         msg = f"**📊 Performance Dashboard**\n\n"
         msg += f"**Overall**: {wins}W / {losses}L ({winrate:.1f}%)\n"
         msg += f"**Avg Win**: +{avg_win:.2f}% | **Avg Loss**: {avg_loss:.2f}%\n"
         msg += f"**Expectancy**: {expectancy:+.2f}%\n\n"
-       
+      
         msg += f"**Best Trade**: {best_trade['symbol']} {best_trade['direction']} @ {best_trade['entry_price']:.2f} → {best_trade['pnl_pct']:+.2f}%\n"
         msg += f"**Worst Trade**: {worst_trade['symbol']} {worst_trade['direction']} @ {worst_trade['entry_price']:.2f} → {worst_trade['pnl_pct']:+.2f}%\n\n"
-       
+      
         msg += "**By Symbol**:\n"
         for symbol, row in symbol_stats.iterrows():
             msg += f" {symbol}: {row['result']:.0f}% WR | {row['pnl_pct']:+.1f}%\n"
-       
+      
         if regime_stats is not None:
             msg += "\n**By Regime**:\n"
             for regime, row in regime_stats.iterrows():
                 msg += f" {regime}: {row['result']:.0f}% WR | {row['pnl_pct']:+.1f}%\n"
-       
+      
         await send_throttled(CHAT_ID, msg, parse_mode='Markdown')
         logging.info(f"Dashboard sent: {total} trades analyzed")
-   
+  
     except Exception as e:
         logging.error(f"Dashboard error: {e}")
         await send_throttled(CHAT_ID, f"Dashboard failed: {str(e)}", parse_mode='Markdown')
-
 # Retained: stats_cmd, health_cmd, recap_cmd, daily_callback, webhook_update
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_user.id) != CHAT_ID:
@@ -1746,7 +1776,6 @@ async def webhook_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def query_grok_instant(context: str, is_alt: bool = False) -> Dict[str, Any]:
     global _working_model
     system_prompt = """You are a quantitative ICT (Inner Circle Trader) analyst with access to real-time market data.
- 
 AVAILABLE FACTORS IN CONTEXT (check each):
 1. Order Block (OB): Strength 2-3, mitigation 0-1 (use if <0.5)
 2. Volume surge: >1.5x 20-period average
@@ -1755,21 +1784,18 @@ AVAILABLE FACTORS IN CONTEXT (check each):
 5. Order flow delta: Imbalance >1%
 6. Premium/discount: Current price position in range (0-1 scale)
 7. HTF alignment: 1h/4h/1d/1w trend confluence
- 
 CONFIDENCE SCORING RULES:
 - 70% = 2 strong factors (e.g., OB str=2 + liq sweep)
 - 75% = 3 factors (add volume surge)
 - 80% = 4 factors (add order flow)
 - 85% = 5 factors (add OI)
 - 90%+ = 6+ factors (full confluence)
- 
 MANDATORY REQUIREMENTS (reject if not met):
 ✓ Long ONLY in discount zone (<0.3 premium_pct)
 ✓ Short ONLY in premium zone (>0.7 premium_pct)
 ✓ OB mitigation <0.5 (if mitigation data provided)
 ✓ Distance from current price <7%
 ✓ Risk-reward ≥1:2 (TP1) and ≥1:4 (TP2)
- 
 OUTPUT FORMAT (precise 4+ decimals, NO rounded numbers):
 {
   "direction": "Long" or "Short",
@@ -1783,9 +1809,7 @@ OUTPUT FORMAT (precise 4+ decimals, NO rounded numbers):
   "strength": 2-3 (OB strength from context),
   "reason": "OB str2 + liq sweep at discount + vol" (max 60 chars)
 }
- 
 If no valid setup → {"no_trade": true}
- 
 """ + (f"\nALTS RULE: For {context.split('|')[0] if '|' in context else 'alts'}, align strictly with BTC institutional trend. Reject counter-BTC trades." if is_alt else "")
     models = [_working_model, "grok-4", "grok-3"] if _working_model else ["grok-4", "grok-3"]
     for model in models:
@@ -1993,24 +2017,24 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Track TP1/TP2 separately
         tp1_hits = 0
         tp2_hits = 0
-       
+      
         for trade in trades:
             if trade['result'] == 'win':
                 tp2_hits += 1
                 tp1_hits += 1 # Assume TP1 also hit if TP2 hit
             elif trade.get('hit_tp1'): # If you track partial TP1
                 tp1_hits += 1
-       
+      
         wins = len([t for t in trades if t['result'] == 'win'])
         total = len([t for t in trades if t['result'] != 'open'])
         winrate = (wins / total * 100) if total > 0 else 0
         total_pnl = sum(t['pnl'] for t in trades)
         sharpe = np.mean([t['pnl'] for t in trades]) / (np.std([t['pnl'] for t in trades]) or np.inf) if trades else 0
-       
+      
         # Calculate hit rates
         tp1_hit_rate = tp1_hits / total if total > 0 else 0.60
         tp2_hit_rate = tp2_hits / total if total > 0 else 0.35
-       
+      
         bt_results = {
             'winrate': winrate,
             'total_pnl': total_pnl,
