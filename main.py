@@ -21,6 +21,9 @@ import time
 from collections import OrderedDict
 import html
 import sys # For explicit exit in main()
+import aiofiles  # NEW: For async JSON I/O
+from collections import deque
+
 SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
 TIMEFRAMES = ['4h', '1d', '1w']
 CHECK_INTERVAL = 7200 # NEW v24.02.0: 2h for more checks
@@ -54,6 +57,10 @@ HTF_CACHE_TTL = 3600
 TICKER_CACHE_TTL = 10
 ORDER_FLOW_CACHE_TTL = 5 # Short TTL for fresh book
 MAX_CACHE_SIZE = 50
+# NEW: Constants for magic numbers
+PRE_CROSS_THRESHOLD_PCT = 0.005
+OB_OVERLAP_THRESHOLD = 0.7
+VOL_SURGE_MULTIPLIER = 1.1
 ohlcv_cache: OrderedDict = OrderedDict()
 ticker_cache: OrderedDict = OrderedDict()
 order_flow_cache: OrderedDict = OrderedDict()
@@ -77,6 +84,11 @@ MAX_DRAWDOWN_PCT = 3.0
 RISK_PER_TRADE_PCT = 1.5
 DAILY_ATR_MULT = 2.0
 SIMULATED_CAPITAL = 10000.0
+# NEW: Telegram throttling
+message_queue = deque()
+last_send_time = 0.0
+# NEW: Model fallback cache
+_working_model = None
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 fetch_sem = asyncio.Semaphore(3)
 def evict_if_full(cache: OrderedDict, max_size: int = MAX_CACHE_SIZE):
@@ -87,6 +99,15 @@ def evict_if_full(cache: OrderedDict, max_size: int = MAX_CACHE_SIZE):
         evicted += 1
     if evicted > 0:
         logging.debug(f"Evicted {evicted} items from {cache.__class__.__name__} cache (now {len(cache)} items)")
+# NEW: Cache access helper
+def cache_get(cache: OrderedDict, key: str, max_size: int = MAX_CACHE_SIZE):
+    evict_if_full(cache, max_size)
+    return cache.get(key)
+class DateTimeEncoder(json.JSONEncoder):  # NEW: Safe datetime serialization
+    def default(self, obj):
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        return super().default(obj)
 class BanManager:
     ban_until: float = 0.0
     cooldown_until: float = 0.0
@@ -98,12 +119,11 @@ class BanManager:
             return False
         last_ban_check = now
         if now < cls.ban_until:
+            if not skip_long_sleep:
+                raise RuntimeError("Global ban active - operation blocked")
             sleep_secs = max(60, cls.ban_until - now + 60)
-            if skip_long_sleep:
-                sleep_secs = min(sleep_secs, 5)
-                logging.info(f"Ban active (short sleep mode); sleeping {sleep_secs:.0f}s")
-            else:
-                logging.info(f"Global ban active; sleeping {sleep_secs:.0f}s until {datetime.fromtimestamp(cls.ban_until + 60).isoformat()}")
+            sleep_secs = min(sleep_secs, 5)
+            logging.info(f"Ban active (short sleep mode); sleeping {sleep_secs:.0f}s")
             await asyncio.sleep(sleep_secs)
             return True
         if now < cls.cooldown_until:
@@ -121,6 +141,9 @@ class BanManager:
         cls.ban_until = ban_ts_ms / 1000.0
         cls.cooldown_until = cls.ban_until + 3600
         logging.warning(f"Global ban updated: until {datetime.fromtimestamp(cls.ban_until).isoformat()} (+1h cooldown)")
+async def save_stats_async(s: Dict[str, Any]):  # NEW: Async save with aiofiles
+    async with aiofiles.open(STATS_FILE, 'w') as f:
+        await f.write(json.dumps(s, indent=2))
 def load_stats() -> Dict[str, Any]:
     if os.path.exists(STATS_FILE):
         try:
@@ -132,23 +155,29 @@ def load_stats() -> Dict[str, Any]:
         except json.JSONDecodeError:
             logging.warning("Invalid stats file, resetting.")
     return {"wins": 0, "losses": 0, "pnl": 0.0, "capital": SIMULATED_CAPITAL, "drawdown": 0.0}
-def save_stats(s: Dict[str, Any]):
+async def save_trades_async(trades: Dict[str, Any]):  # NEW: Async with encoder
     try:
-        with open(STATS_FILE, 'w') as f:
-            json.dump(s, f, indent=2)
+        dumpable = {}
+        for sym, trade in trades.items():
+            t_copy = trade.copy()
+            if 'last_check' in t_copy and t_copy['last_check']:
+                t_copy['last_check'] = trade['last_check'].isoformat()
+            if 'entry_time' in t_copy and t_copy['entry_time']:
+                t_copy['entry_time'] = trade['entry_time'].isoformat()
+            dumpable[sym] = t_copy
+        async with aiofiles.open(TRADES_FILE, 'w') as f:
+            await f.write(json.dumps(dumpable, indent=2, cls=DateTimeEncoder))
     except Exception as e:
-        logging.error(f"Failed to save stats: {e}")
-stats = load_stats()
-stats_lock = asyncio.Lock()
+        logging.error(f"Failed to save trades: {e}")
 def load_trades() -> Dict[str, Any]:
     if os.path.exists(TRADES_FILE):
         try:
             with open(TRADES_FILE, 'r') as f:
                 loaded = json.load(f)
             for trade in loaded.values():
-                if 'last_check' in trade:
+                if 'last_check' in trade and trade['last_check']:
                     trade['last_check'] = datetime.fromisoformat(trade['last_check'])
-                if 'entry_time' in trade:
+                if 'entry_time' in trade and trade['entry_time']:
                     trade['entry_time'] = datetime.fromisoformat(trade['entry_time'])
                 if 'processed' not in trade:
                     trade['processed'] = False
@@ -156,29 +185,29 @@ def load_trades() -> Dict[str, Any]:
         except (json.JSONDecodeError, KeyError) as e:
             logging.warning(f"Invalid trades file, resetting: {e}")
     return {}
-def save_trades(trades: Dict[str, Any]):
+async def save_protected_async(trades: Dict[str, Any]):  # NEW: Async with encoder
     try:
         dumpable = {}
         for sym, trade in trades.items():
             t_copy = trade.copy()
-            if 'last_check' in t_copy:
+            if 'last_check' in t_copy and t_copy['last_check']:
                 t_copy['last_check'] = trade['last_check'].isoformat()
-            if 'entry_time' in t_copy:
+            if 'entry_time' in t_copy and t_copy['entry_time']:
                 t_copy['entry_time'] = trade['entry_time'].isoformat()
             dumpable[sym] = t_copy
-        with open(TRADES_FILE, 'w') as f:
-            json.dump(dumpable, f, indent=2)
+        async with aiofiles.open(PROTECTED_TRADES_FILE, 'w') as f:
+            await f.write(json.dumps(dumpable, indent=2, cls=DateTimeEncoder))
     except Exception as e:
-        logging.error(f"Failed to save trades: {e}")
+        logging.error(f"Failed to save protected trades: {e}")
 def load_protected() -> Dict[str, Any]:
     if os.path.exists(PROTECTED_TRADES_FILE):
         try:
             with open(PROTECTED_TRADES_FILE, 'r') as f:
                 loaded = json.load(f)
             for trade in loaded.values():
-                if 'last_check' in trade:
+                if 'last_check' in trade and trade['last_check']:
                     trade['last_check'] = datetime.fromisoformat(trade['last_check'])
-                if 'entry_time' in trade:
+                if 'entry_time' in trade and trade['entry_time']:
                     trade['entry_time'] = datetime.fromisoformat(trade['entry_time'])
                 if 'processed' not in trade:
                     trade['processed'] = False
@@ -186,26 +215,18 @@ def load_protected() -> Dict[str, Any]:
         except (json.JSONDecodeError, KeyError) as e:
             logging.warning(f"Invalid protected trades file, resetting: {e}")
     return {}
-def save_protected(trades: Dict[str, Any]):
-    try:
-        dumpable = {}
-        for sym, trade in trades.items():
-            t_copy = trade.copy()
-            if 'last_check' in t_copy:
-                t_copy['last_check'] = trade['last_check'].isoformat()
-            if 'entry_time' in t_copy:
-                t_copy['entry_time'] = trade['entry_time'].isoformat()
-            dumpable[sym] = t_copy
-        with open(PROTECTED_TRADES_FILE, 'w') as f:
-            json.dump(dumpable, f, indent=2)
-    except Exception as e:
-        logging.error(f"Failed to save protected trades: {e}")
-open_trades = load_trades()
-protected_trades = load_protected()
 def get_clean_symbol(trade_key: str) -> str:
     return re.sub(r'roadmap\d+$', '', trade_key)
 def format_price(price: float) -> str:
     return f"{price:,.4f}"
+# NEW: Throttled send
+async def send_throttled(chat_id: str, text: str, parse_mode: Optional[str] = None):
+    global last_send_time
+    now = time.time()
+    if now - last_send_time < 1.0:
+        await asyncio.sleep(1.0 - (now - last_send_time))
+    await bot.send_message(chat_id, text, parse_mode=parse_mode)
+    last_send_time = time.time()
 # Order Flow: Fetch batch order books (enhanced for walls)
 async def fetch_order_flow_batch() -> Dict[str, Dict]:
     async with fetch_sem:
@@ -216,7 +237,7 @@ async def fetch_order_flow_batch() -> Dict[str, Dict]:
             return {s: order_flow_cache[s]['book'] for s in SYMBOLS}
         logging.debug(f"Partial cache hit for order flow ({cache_hits}/{len(SYMBOLS)}); polling fresh")
         if await BanManager.check_and_sleep():
-            return {s: order_flow_cache.get(s, {}).get('book') for s in SYMBOLS}
+            return {s: cache_get(order_flow_cache, s, ORDER_FLOW_CACHE_TTL).get('book') if cache_get(order_flow_cache, s, ORDER_FLOW_CACHE_TTL) else {} for s in SYMBOLS}
         evict_if_full(order_flow_cache)
         order_books = {}
         backoff = 1
@@ -238,7 +259,7 @@ async def fetch_order_flow_batch() -> Dict[str, Dict]:
                 else:
                     raise
         else:
-            order_books = {s: order_flow_cache.get(s, {}).get('book') for s in SYMBOLS}
+            order_books = {s: cache_get(order_flow_cache, s).get('book') if cache_get(order_flow_cache, s) else {} for s in SYMBOLS}
         return order_books
 # NEW v24.02.0: Enhanced Order Flow - delta, footprint + walls/sweeps
 def calculate_order_flow(df: pd.DataFrame, order_book: Optional[Dict] = None) -> pd.DataFrame:
@@ -247,6 +268,12 @@ def calculate_order_flow(df: pd.DataFrame, order_book: Optional[Dict] = None) ->
     df = df.copy()
     bids = order_book.get('bids', [])[:5] # Top 5 for walls
     asks = order_book.get('asks', [])[:5]
+    # NEW: Validation for empty books
+    if not bids or not asks:
+        df['order_delta'] = 0
+        df['cum_delta'] = 0
+        df['liq_sweep'] = False
+        return df
     buy_vol = sum(amount for _, amount in bids)
     sell_vol = sum(amount for _, amount in asks)
     total_vol = buy_vol + sell_vol
@@ -282,16 +309,20 @@ def is_consolidation(df: pd.DataFrame) -> bool:
         return False
     adx_val = adx['ADX_14'].iloc[-1]
     vol_ratio = df['volume'].iloc[-1] / df['volume'].rolling(20).mean().iloc[-1]
-    consol = (adx_val < 25) and (vol_ratio < 1.1) # Low trend + low vol = consol
+    consol = (adx_val < 25) and (vol_ratio < VOL_SURGE_MULTIPLIER) # Low trend + low vol = consol
     logging.info(f"Consol check: ADX={adx_val:.1f}, vol_ratio={vol_ratio:.2f} -> {consol}")
     return consol
 async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # NEW: Authorization
+    if str(update.effective_user.id) != CHAT_ID:
+        await update.message.reply_text("Unauthorized")
+        return
     logging.info(f"/backtest triggered by user {update.effective_user.id}")
     try:
         since = int((datetime.now(timezone.utc) - timedelta(days=90)).timestamp() * 1000)
         df = await fetch_ohlcv('BTC/USDT', '1d', limit=90, since=since)
         if len(df) == 0:
-            await update.message.reply_text("Data unavailable (ban/active cooldown?), backtest skipped. Try later.", parse_mode='Markdown')
+            await send_throttled(CHAT_ID, "Data unavailable (ban/active cooldown?), backtest skipped. Try later.", parse_mode='Markdown')
             return
         df = pd.DataFrame(df, columns=['ts', 'open', 'high', 'low', 'close', 'volume']) if 'ts' not in df.columns else df
         df['date'] = pd.to_datetime(df['ts'], unit='ms')
@@ -305,7 +336,7 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 continue
             if (df['ema50'].iloc[i] > df['ema200'].iloc[i] and # EMA200 bias
                 df['ema50'].iloc[i-1] <= df['ema100'].iloc[i-1] and
-                df['volume'].iloc[i] > 1.1 * df['volume_sma'].iloc[i]): # RELAXED vol
+                df['volume'].iloc[i] > VOL_SURGE_MULTIPLIER * df['volume_sma'].iloc[i]): # RELAXED vol
                 entry = df['close'].iloc[i]
                 sl = entry * 0.98
                 tp = entry * 1.06
@@ -332,7 +363,7 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 continue
             elif (df['ema50'].iloc[i] < df['ema100'].iloc[i] and
                   df['ema50'].iloc[i-1] >= df['ema100'].iloc[i-1] and
-                  df['volume'].iloc[i] > 1.1 * df['volume_sma'].iloc[i]):
+                  df['volume'].iloc[i] > VOL_SURGE_MULTIPLIER * df['volume_sma'].iloc[i]):
                 entry = df['close'].iloc[i]
                 sl = entry * 1.03
                 tp = entry * 0.96
@@ -360,14 +391,14 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_pnl = sum(t['pnl'] for t in trades)
         sharpe = np.mean([t['pnl'] for t in trades]) / (np.std([t['pnl'] for t in trades]) or np.inf) if trades else 0
         msg = f"**Daily Backtest (90d BTC/USDT 1d)**\n\nWins: {wins}/{total} ({winrate:.1f}%)\nTotal PnL: {total_pnl:+.2f} ({total_pnl/capital*100:.2f}%)\nSharpe Ratio: {sharpe:.2f}"
-        await update.message.reply_text(msg, parse_mode='Markdown')
+        await send_throttled(CHAT_ID, msg, parse_mode='Markdown')
         bt_results = {'winrate': winrate, 'total_pnl': total_pnl, 'sharpe': sharpe, 'date': datetime.now(timezone.utc).isoformat()}
-        with open(BACKTEST_FILE, 'w') as f:
-            json.dump(bt_results, f, indent=2)
+        async with aiofiles.open(BACKTEST_FILE, 'w') as f:  # NEW: Async write
+            await f.write(json.dumps(bt_results, indent=2))
         logging.info(f"Backtest completed: {winrate:.1f}% winrate")
     except Exception as e:
         logging.error(f"/backtest error: {e}")
-        await update.message.reply_text(f"Backtest failed: {str(e)}", parse_mode='Markdown')
+        await send_throttled(CHAT_ID, f"Backtest failed: {str(e)}", parse_mode='Markdown')
 async def send_welcome_once():
     if not os.path.exists(FLAG_FILE):
         try:
@@ -379,13 +410,15 @@ async def send_welcome_once():
                 "• All: ICT daily, reversals prio, no range noise."
             )
             escaped_text = html.escape(welcome_text)
-            await bot.send_message(CHAT_ID, escaped_text, parse_mode='HTML')
+            await send_throttled(CHAT_ID, escaped_text, parse_mode='HTML')
             open(FLAG_FILE, "w").close()
             logging.info("Welcome sent (v24.02.1)")
         except Exception as e:
             logging.error(f"Failed to send welcome: {e}")
+# Updated: With model cache
 async def query_grok_instant(context: str, is_alt: bool = False) -> Dict[str, Any]:
-    models = ["grok-4", "grok-3"]
+    global _working_model
+    models = [_working_model, "grok-4", "grok-3"] if _working_model else ["grok-4", "grok-3"]
     example_json = r'{"symbol":"BTC","direction":"Long" or "Short","entry_low":68234.5678,"entry_high":68456.1234,"sl":67987.2345,"tp1":68890.7890,"tp2":69543.4567,"leverage":3-7,"confidence":70-98,"strength":2,"reason":"concise daily reason (max 80 chars, e.g., HTF OB + vol on 1d)"}'
     system_prompt = (
         "You are an institutional whale trader spotting large footprints for daily trading. Output ONLY valid JSON. "
@@ -418,6 +451,7 @@ async def query_grok_instant(context: str, is_alt: bool = False) -> Dict[str, An
                 except json.JSONDecodeError:
                     logging.warning(f"Invalid JSON from {model}: {content[:100]}...")
                     result = {"no_trade": True}
+                _working_model = model
                 if model != "grok-4":
                     logging.info(f"Fell back to {model} for query.")
                 return result
@@ -445,7 +479,9 @@ def check_rr(trade: Dict[str, Any]) -> bool:
     rr2 = abs(trade['tp2'] - entry_mid) / abs(trade['sl'] - entry_mid)
     return rr2 >= 2.0
 # Update query_grok_potential: Simplified prompt, focus daily/OB/liquidity
+# Updated: With model cache
 async def query_grok_potential(zones: List[Dict], symbol: str, current_price: float, trend: str, btc_trend: Optional[str], atr: float = 0) -> Dict[str, Any]:
+    global _working_model
     is_alt = symbol != 'BTC/USDT'
     filtered_zones = [z for z in zones if z.get('strength', 0) >= 2 and z.get('prob', 0) >= 70] # RELAXED v24.02.0
     if not filtered_zones:
@@ -458,7 +494,7 @@ async def query_grok_potential(zones: List[Dict], symbol: str, current_price: fl
         "Else: {'no_live_trade': true, 'roadmap': [zones list]} Top 1-3 daily setups. Precise levels, SL ATR*2, R:R 1:2+. No consol signals."
         f"Alts: BTC align only. No trade if consol."
     )
-    models = ["grok-4", "grok-3"]
+    models = [_working_model, "grok-4", "grok-3"] if _working_model else ["grok-4", "grok-3"]
     for model in models:
         payload = {
             "model": model,
@@ -486,6 +522,7 @@ async def query_grok_potential(zones: List[Dict], symbol: str, current_price: fl
                                 precise = False
                                 break
                     if precise:
+                        _working_model = model
                         return result
                     attempt += 1
                     if attempt == 2:
@@ -501,7 +538,9 @@ async def query_grok_potential(zones: List[Dict], symbol: str, current_price: fl
         if attempt == 2:
             continue
     return {"error": "All models failed"}
+# Updated: With model cache
 async def query_grok_watch_levels(symbol: str, price: float, trend: str, btc_trend: Optional[str], data: Dict[str, pd.DataFrame], oi_data: Optional[Dict[str, float]]) -> str:
+    global _working_model
     is_alt = symbol != 'BTC/USDT'
     df_1d = data.get('1d', pd.DataFrame())
     obs = await find_unmitigated_order_blocks(df_1d, tf='1d', symbol=symbol)
@@ -518,7 +557,7 @@ async def query_grok_watch_levels(symbol: str, price: float, trend: str, btc_tre
         "Focus 1d OB str>=2, liq sweeps, POC. 2-3 levels max. Bias from trend. No spam, precise prices."
         f"Alts: BTC align."
     )
-    models = ["grok-4", "grok-3"]
+    models = [_working_model, "grok-4", "grok-3"] if _working_model else ["grok-4", "grok-3"]
     for model in models:
         payload = {
             "model": model,
@@ -535,6 +574,7 @@ async def query_grok_watch_levels(symbol: str, price: float, trend: str, btc_tre
                 r.raise_for_status()
                 content = r.json()["choices"][0]["message"]["content"].strip()
                 if len(content) > 10:
+                    _working_model = model
                     return content
         except Exception as e:
             logging.error(f"Watch levels Grok error with {model} for {symbol}: {e}")
@@ -577,14 +617,16 @@ async def fetch_ohlcv(symbol: str, tf: str, limit: int = 200, since: Optional[in
     async with fetch_sem:
         if await BanManager.check_and_sleep():
             logging.warning(f"OHLCV skipped for {symbol} {tf}: ban/cooldown active")
-            return ohlcv_cache.get(f"{symbol}{tf}", {}).get('df', pd.DataFrame())
+            return cache_get(ohlcv_cache, f"{symbol}{tf}").get('df', pd.DataFrame()) if cache_get(ohlcv_cache, f"{symbol}{tf}") else pd.DataFrame()
         cache_key = f"{symbol}{tf}"
         now = time.time()
         ttl = HTF_CACHE_TTL if tf in ['1d', '1w'] else CACHE_TTL
         cache_hit = False
-        if cache_key in ohlcv_cache and now - ohlcv_cache[cache_key]['timestamp'] < ttl:
+        cached = cache_get(ohlcv_cache, cache_key)
+        if cached and now - cached['timestamp'] < ttl:
             cache_hit = True
             logging.debug(f"Cache hit for OHLCV {cache_key}")
+            return cached['df']
         else:
             logging.debug(f"Cache miss for OHLCV {cache_key}; fetching fresh")
         evict_if_full(ohlcv_cache)
@@ -599,9 +641,20 @@ async def fetch_ohlcv(symbol: str, tf: str, limit: int = 200, since: Optional[in
                 data = await exchange.fetch_ohlcv(symbol, norm_tf, **params)
                 df = pd.DataFrame(data, columns=['ts', 'open', 'high', 'low', 'close', 'volume'])
                 df['date'] = pd.to_datetime(df['ts'], unit='ms')
-                # NEW FIX: Set sorted DatetimeIndex for VWAP compatibility
-                df = df.set_index('date').sort_index()
-                df = df.reset_index() # Keep 'date' as column for other uses
+                # FIXED VWAP: Use DatetimeIndex for reliable computation; check volume to avoid full NaNs
+                df_indexed = df.set_index('date').sort_index()
+                total_vol = df_indexed['volume'].sum()
+                if total_vol > 0:
+                    vwap_series = ta.vwap(df_indexed['high'], df_indexed['low'],
+                                          df_indexed['close'], df_indexed['volume'])
+                    # Align by index, not raw values
+                    df = df.set_index('date')
+                    df['vwap'] = vwap_series
+                    df = df.reset_index()
+                    logging.debug(f"VWAP computed successfully (total vol: {total_vol:.0f})")
+                else:
+                    df['vwap'] = np.nan
+                    logging.warning(f"VWAP skipped for df len {len(df)}: total volume=0")
                 ohlcv_cache[cache_key] = {'df': df, 'timestamp': now}
                 success = True
                 logging.info(f"OHLCV fetched for {symbol} {tf} (attempt {attempt+1})")
@@ -616,7 +669,7 @@ async def fetch_ohlcv(symbol: str, tf: str, limit: int = 200, since: Optional[in
                     break
         sleep_time = 3 if success else 5
         await asyncio.sleep(sleep_time)
-        return ohlcv_cache.get(cache_key, {}).get('df', pd.DataFrame())
+        return cache_get(ohlcv_cache, cache_key).get('df', pd.DataFrame()) if cache_get(ohlcv_cache, cache_key) else pd.DataFrame()
 async def fetch_ticker_batch() -> Dict[str, Optional[float]]:
     async with fetch_sem:
         now = time.time()
@@ -626,7 +679,7 @@ async def fetch_ticker_batch() -> Dict[str, Optional[float]]:
             return {s: ticker_cache[s]['price'] for s in SYMBOLS}
         logging.debug(f"Partial cache hit for tickers ({cache_hits}/{len(SYMBOLS)}); polling fresh")
         if await BanManager.check_and_sleep():
-            return {s: ticker_cache.get(s, {}).get('price') for s in SYMBOLS}
+            return {s: cache_get(ticker_cache, s).get('price') if cache_get(ticker_cache, s) else None for s in SYMBOLS}
         evict_if_full(ticker_cache)
         backoff = 1
         for attempt in range(3):
@@ -650,7 +703,7 @@ async def fetch_ticker_batch() -> Dict[str, Optional[float]]:
                 else:
                     raise
         else:
-            prices = {s: ticker_cache.get(s, {}).get('price') for s in SYMBOLS}
+            prices = {s: cache_get(ticker_cache, s).get('price') if cache_get(ticker_cache, s) else None for s in SYMBOLS}
         return prices
 async def fetch_ticker(symbol: str) -> Optional[float]:
     prices = await fetch_ticker_batch()
@@ -673,7 +726,7 @@ async def price_background_task():
 def add_indicators(df: pd.DataFrame, order_book: Optional[Dict] = None) -> pd.DataFrame:
     if len(df) == 0:
         return df
-    df = df.copy()
+    # REMOVED: df = df.copy() - avoid redundant copy
     df['ema50'] = ta.ema(df['close'], 50)
     df['ema100'] = ta.ema(df['close'], 100)
     df['ema200'] = ta.ema(df['close'], 200)
@@ -699,17 +752,19 @@ def add_indicators(df: pd.DataFrame, order_book: Optional[Dict] = None) -> pd.Da
         if stoch is not None and len(stoch.columns) >= 2:
             df['stoch_k'] = stoch.iloc[:, 0]
             df['stoch_d'] = stoch.iloc[:, 1]
-        # FIXED VWAP: Use DatetimeIndex for reliable computation; check volume to avoid full NaNs
+        # FIXED VWAP alignment
         if 'date' in df.columns:
-            df_temp = df.set_index('date').sort_index()  # Ensure chronological DatetimeIndex
-            total_vol = df_temp['volume'].sum()
+            df_indexed = df.set_index('date').sort_index()
+            total_vol = df_indexed['volume'].sum()
             if total_vol > 0:
-                vwap_series = ta.vwap(df_temp['high'], df_temp['low'], df_temp['close'], df_temp['volume'])
-                df['vwap'] = vwap_series.values  # Assign values (order preserved)
-                logging.debug(f"VWAP computed successfully (total vol: {total_vol:.0f})")
+                vwap_series = ta.vwap(df_indexed['high'], df_indexed['low'],
+                                      df_indexed['close'], df_indexed['volume'])
+                # Align by index, not raw values
+                df = df.set_index('date')
+                df['vwap'] = vwap_series
+                df = df.reset_index()
             else:
                 df['vwap'] = np.nan
-                logging.warning(f"VWAP skipped for df len {len(df)}: total volume=0")
         else:
             # Fallback if no 'date' column
             df['vwap'] = np.nan
@@ -717,7 +772,7 @@ def add_indicators(df: pd.DataFrame, order_book: Optional[Dict] = None) -> pd.Da
         # Log NaNs only if unexpected (post-computation check)
         if 'vwap' in df.columns:
             nan_count = df['vwap'].isna().sum()
-            if nan_count > len(df) * 0.5:  # Warn only if >50% NaNs (e.g., not just early rows)
+            if nan_count > len(df) * 0.5: # Warn only if >50% NaNs (e.g., not just early rows)
                 logging.warning(f"VWAP has {nan_count} NaNs in df of len {len(df)} (possible data issue)")
     # Order Flow: Calculate delta/footprint/sweep
     df = calculate_order_flow(df, order_book)
@@ -725,7 +780,7 @@ def add_indicators(df: pd.DataFrame, order_book: Optional[Dict] = None) -> pd.Da
     subset_key = [col for col in key_cols if col in df.columns]
     df = df.dropna(subset=subset_key)
     return df
-def zones_overlap(z1_low: float, z1_high: float, z2_low: float, z2_high: float, threshold: float = 0.5) -> float:
+def zones_overlap(z1_low: float, z1_high: float, z2_low: float, z2_high: float, threshold: float = OB_OVERLAP_THRESHOLD) -> float:  # UPDATED: Constant
     o_low = max(z1_low, z2_low)
     o_high = min(z1_high, z2_high)
     if o_low >= o_high:
@@ -744,7 +799,7 @@ async def find_unmitigated_order_blocks(df: pd.DataFrame, lookback: int = 100, a
     df_local['direction'] = np.where(df_local['close'] > df_local['open'], 1, -1)
     df_local['swing_high'] = df_local['high'].rolling(10, center=True).max() == df_local['high']
     df_local['swing_low'] = df_local['low'].rolling(10, center=True).min() == df_local['low']
-    df_local['vol_surge'] = df_local['volume'] > 1.1 * df_local['volume'].rolling(20).mean() # RELAXED v24.02.0: 1.1x
+    df_local['vol_surge'] = df_local['volume'] > VOL_SURGE_MULTIPLIER * df_local['volume'].rolling(20).mean() # RELAXED v24.02.0: 1.1x
     logging.info(f"Vol surge detected: {sum(df_local['vol_surge'])} in {len(df_local)} bars")
     df_local['volume_sma'] = df_local['volume'].rolling(20).mean()
     obs = {'bullish': [], 'bearish': []}
@@ -756,7 +811,7 @@ async def find_unmitigated_order_blocks(df: pd.DataFrame, lookback: int = 100, a
             if move_down and abs((ob_low - df_local['low'].iloc[i+5:i+10].min()) / ob_low) > 0.02:
                 mitigated = any(df_local['high'].iloc[i+1:] > ob_high)
                 zone_type = 'Breaker' if any(df_local['low'].iloc[i+1:i+6] < ob_low) else 'OB'
-                strength = 3 if zone_type == 'OB' and df_local['volume'].iloc[i] > 1.1 * df_local['volume_sma'].iloc[i] else 2 # NEW v24.02.0: str=2 allowed
+                strength = 3 if zone_type == 'OB' and df_local['volume'].iloc[i] > VOL_SURGE_MULTIPLIER * df_local['volume_sma'].iloc[i] else 2 # NEW v24.02.0: str=2 allowed
                 if not mitigated and strength >= 2: # RELAXED: >=2
                     obs['bearish'].append({
                         'low': ob_low, 'high': ob_high, 'type': zone_type,
@@ -770,13 +825,13 @@ async def find_unmitigated_order_blocks(df: pd.DataFrame, lookback: int = 100, a
             if move_up and abs((df_local['high'].iloc[i+5:i+10].max() - ob_high) / ob_high) > 0.02:
                 mitigated = any(df_local['low'].iloc[i+1:] < ob_low)
                 zone_type = 'Breaker' if any(df_local['high'].iloc[i+1:i+6] > ob_high) else 'OB'
-                strength = 3 if zone_type == 'OB' and df_local['volume'].iloc[i] > 1.1 * df_local['volume_sma'].iloc[i] else 2 # NEW: str=2
+                strength = 3 if zone_type == 'OB' and df_local['volume'].iloc[i] > VOL_SURGE_MULTIPLIER * df_local['volume_sma'].iloc[i] else 2 # NEW: str=2
                 if not mitigated and strength >= 2: # RELAXED
                     obs['bullish'].append({
                         'low': ob_low, 'high': ob_high, 'type': zone_type,
                         'strength': strength, 'index': i, 'mitigated': False
                     })
-    # HTF merge (retained, but limit to 3 per type) NEW: [:3]
+    # HTF merge (optimized)
     if tf in ['1d', '1w'] and symbol:
         try:
             df_1h = await fetch_ohlcv(symbol, '1h', 200)
@@ -784,9 +839,13 @@ async def find_unmitigated_order_blocks(df: pd.DataFrame, lookback: int = 100, a
             for ob_type in ['bullish', 'bearish']:
                 merged = []
                 for ob_htf in obs[ob_type]:
-                    for ob_ltf in obs_1h[ob_type]:
-                        overlap_ratio = zones_overlap(ob_htf['low'], ob_htf['high'], ob_ltf['low'], ob_ltf['high'], 0.7)
-                        if overlap_ratio > 0.7:
+                    if obs_1h[ob_type]:  # Avoid empty max
+                        best_match = max(
+                            (zones_overlap(ob_htf['low'], ob_htf['high'], ob_ltf['low'], ob_ltf['high']), ob_ltf)
+                            for ob_ltf in obs_1h[ob_type]
+                        )
+                        if best_match[0] > OB_OVERLAP_THRESHOLD:
+                            ob_ltf = best_match[1]
                             merged_low = min(ob_htf['low'], ob_ltf['low'])
                             merged_high = max(ob_htf['high'], ob_ltf['high'])
                             merged_strength = max(ob_htf['strength'], ob_ltf['strength'])
@@ -794,7 +853,9 @@ async def find_unmitigated_order_blocks(df: pd.DataFrame, lookback: int = 100, a
                                 'low': merged_low, 'high': merged_high, 'type': ob_htf['type'],
                                 'strength': merged_strength, 'index': ob_htf['index'], 'mitigated': False
                             })
-                            logging.info(f"Merged {ob_type} OB for {symbol} {tf}: overlap {overlap_ratio:.2f}")
+                            logging.info(f"Merged {ob_type} OB for {symbol} {tf}: overlap {best_match[0]:.2f}")
+                    else:
+                        merged.append(ob_htf)  # No LTF, keep HTF
                 obs[ob_type] = merged[:3] # NEW v24.02.0: Up to 3 for more options
         except Exception as e:
             logging.warning(f"HTF 1h verify failed for {symbol} {tf}: {e}")
@@ -998,12 +1059,12 @@ def detect_macd(df: pd.DataFrame, tf: str) -> Optional[str]:
     if df['macd'].iloc[-1] < df['macd_signal'].iloc[-1] and df['macd'].iloc[-2] >= df['macd_signal'].iloc[-2]:
         return f"Bearish MACD Crossover ({tf})"
     return None
-def detect_pre_cross(df: pd.DataFrame, tf: str) -> Optional[str]:
+def detect_pre_cross(df: pd.DataFrame, tf: str) -> Optional[str]:  # UPDATED: Constant
     if len(df) < 2 or tf not in ['4h', '1d'] or 'ema50' not in df.columns or 'ema100' not in df.columns or pd.isna(df['ema50'].iloc[-1]) or pd.isna(df['ema100'].iloc[-1]):
         return None
     l = df.iloc[-1]
     diff = abs(l['ema50'] - l['ema100']) / l['close']
-    if diff < 0.005:
+    if diff < PRE_CROSS_THRESHOLD_PCT:
         return "Golden Cross Incoming" if l['ema50'] > l['ema100'] else "Death Cross Incoming"
     return None
 def detect_divergence(df: pd.DataFrame, tf: str) -> Optional[str]:
@@ -1024,7 +1085,7 @@ def detect_divergence(df: pd.DataFrame, tf: str) -> Optional[str]:
     if price.iloc[-1] > price.loc[swing_high_idx] and rsi.iloc[-1] < rsi.loc[swing_high_idx] and rsi.iloc[-1] > 75:
         return f"Bearish RSI Divergence ({tf})"
     return None
-def detect_candle_patterns(df: pd.DataFrame, tf: str) -> List[str]:
+def detect_candle_patterns(df: pd.DataFrame, tf: str) -> List[str]:  # UPDATED: Constant
     if len(df) < 3:
         return []
     patterns = set()
@@ -1033,7 +1094,7 @@ def detect_candle_patterns(df: pd.DataFrame, tf: str) -> List[str]:
     upper = c['high'] - max(c['open'], c['close'])
     lower = min(c['open'], c['close']) - c['low']
     range_size = c['high'] - c['low']
-    if body > 0.7 * range_size and df['volume'].iloc[-1] > 1.1 * df['volume_sma'].iloc[-1]: # RELAXED vol
+    if body > 0.7 * range_size and df['volume'].iloc[-1] > VOL_SURGE_MULTIPLIER * df['volume_sma'].iloc[-1]: # RELAXED vol
         dir_str = "Bullish" if c['close'] > c['open'] else "Bearish"
         patterns.add(f"{dir_str} Displacement Candle ({tf})")
     if body > 0 and lower > 2 * body and upper < body * 0.3 and c['close'] > p['close']:
@@ -1047,13 +1108,14 @@ def detect_candle_patterns(df: pd.DataFrame, tf: str) -> List[str]:
     if c['high'] < p['high'] and c['low'] > p['low']:
         patterns.add(f"Inside Bar ({tf})")
     return list(patterns)
+# Updated: Exposure fix, async saves, throttled sends, slippage (already correct)
 async def process_trade(trades: Dict[str, Any], to_delete: List[str], now: datetime, current_capital: float, prices: Dict[str, Optional[float]], updated_keys: List[str], is_protected: bool = False):
     for trade_key, trade in list(trades.items()):
         clean_symbol = get_clean_symbol(trade_key)
         logging.debug(f"Clean symbol for tracking: {clean_symbol} from key {trade_key}")
         if 'last_check' in trade and now - trade['last_check'] > timedelta(hours=TRADE_TIMEOUT_HOURS):
             logging.info(f"Timeout for {'protected ' if is_protected else ''}{trade_key}")
-            await bot.send_message(CHAT_ID, f"**TIMEOUT** {clean_symbol.replace('/USDT','')} (*neutral PnL*)", parse_mode='Markdown')
+            await send_throttled(CHAT_ID, f"**TIMEOUT** {clean_symbol.replace('/USDT','')} (*neutral PnL*)", parse_mode='Markdown')
             to_delete.append(trade_key)
             updated_keys.append(trade_key)
             continue
@@ -1085,8 +1147,9 @@ async def process_trade(trades: Dict[str, Any], to_delete: List[str], now: datet
                     slippage_note = " (*late entry via slippage*)"
             logging.info(f"Checking {clean_symbol} ({trade.get('type', '')} {trade['direction']} {trade['confidence']}%) - price {price:.4f} vs zone {entry_low:.4f}-{entry_high:.4f}, in_zone={in_zone}{slippage_note}")
             if in_zone:
+                # FIXED: Exposure with entry_price
                 current_exposure = sum(
-                    t.get('position_size', 0) * t.get('leverage', 1)
+                    t.get('position_size', 0) * t.get('entry_price', 0) * t.get('leverage', 1)
                     for trades_dict in [open_trades, protected_trades]
                     for t in trades_dict.values()
                     if t.get('active')
@@ -1099,7 +1162,8 @@ async def process_trade(trades: Dict[str, Any], to_delete: List[str], now: datet
                     logging.info(f"Skipped {'protected ' if is_protected else ''}entry for {clean_symbol}: exposure would exceed 5% ({current_exposure + proposed_exposure:.2f} > {max_exposure:.2f})")
                     continue
                 trade['active'] = True
-                trade['entry_price'] = price + (SLIPPAGE_PCT * price if trade['direction'] == 'Long' else -SLIPPAGE_PCT * price)
+                slippage = SLIPPAGE_PCT * price
+                trade['entry_price'] = price + slippage if trade['direction'] == 'Long' else price - slippage
                 if 'entry_time' not in trade:
                     trade['entry_time'] = now
                 risk_amount = current_capital * RISK_PER_TRADE_PCT / 100
@@ -1107,11 +1171,11 @@ async def process_trade(trades: Dict[str, Any], to_delete: List[str], now: datet
                 tag = ('(*roadmap*)' if trade.get('type') == 'roadmap' else ('(*protected*)' if is_protected else ''))
                 if tag == '(*roadmap*)':
                     logging.info(f"Roadmap ENTRY ACTIVATED for {clean_symbol} @ {price:.4f} (conf {trade['confidence']}%)")
-                await bot.send_message(CHAT_ID,
-                                       f"**ENTRY ACTIVATED** {tag} (Size: {trade['position_size']:.4f}){slippage_note}\n\n"
-                                       f"**{clean_symbol.replace('/USDT','')} {trade['direction']}** @ {format_price(price)}\n"
-                                       f"*SL* {format_price(trade['sl'])} │ *TP1* {format_price(trade['tp1'])} │ *TP2* {format_price(trade['tp2'])} │ {trade['leverage']}x",
-                                       parse_mode='Markdown')
+                await send_throttled(CHAT_ID,
+                                     f"**ENTRY ACTIVATED** {tag} (Size: {trade['position_size']:.4f}){slippage_note}\n\n"
+                                     f"**{clean_symbol.replace('/USDT','')} {trade['direction']}** @ {format_price(price)}\n"
+                                     f"*SL* {format_price(trade['sl'])} │ *TP1* {format_price(trade['tp1'])} │ *TP2* {format_price(trade['tp2'])} │ {trade['leverage']}x",
+                                     parse_mode='Markdown')
                 updated_keys.append(trade_key)
         if trade.get('active'):
             entry_price = trade['entry_price']
@@ -1137,16 +1201,17 @@ async def process_trade(trades: Dict[str, Any], to_delete: List[str], now: datet
                 net_pnl_pct = net_pnl_usdt / current_capital * 100
                 result = "WIN" if hit_tp else "LOSS"
                 tag = ('(*roadmap*)' if trade.get('type') == 'roadmap' else ('(*protected*)' if is_protected else ''))
-                await bot.send_message(CHAT_ID,
-                                       f"**{result}** {clean_symbol.replace('/USDT','')} {tag}\n\n"
-                                       f"+{net_pnl_pct:+.2f}% (size {size:.4f}) @ {trade['leverage']}x (conf {trade['confidence']}%) **[fees adj]**",
-                                       parse_mode='Markdown')
+                await send_throttled(CHAT_ID,
+                                     f"**{result}** {clean_symbol.replace('/USDT','')} {tag}\n\n"
+                                     f"+{net_pnl_pct:+.2f}% (size {size:.4f}) @ {trade['leverage']}x (conf {trade['confidence']}%) **[fees adj]**",
+                                     parse_mode='Markdown')
                 async with stats_lock:
-                    delta_capital = current_capital * (net_pnl_pct / 100)
+                    # FIXED: Use stats['capital'] inside lock, save inside
+                    delta_capital = stats['capital'] * (net_pnl_pct / 100)
                     stats['capital'] += delta_capital
                     stats['pnl'] = (stats['capital'] - SIMULATED_CAPITAL) / SIMULATED_CAPITAL * 100
                     stats['wins' if hit_tp else 'losses'] += 1
-                save_stats(stats)
+                    await save_stats_async(stats)
                 to_delete.append(trade_key)
                 updated_keys.append(trade_key)
 async def btc_trend_update(context):
@@ -1226,8 +1291,8 @@ async def track_callback(context):
                 if not open_trades[key].get('active'):
                     del open_trades[key]
                     updated_keys_open.append(key)
-            save_trades(open_trades)
-            await bot.send_message(CHAT_ID, f"**PAUSE:** Drawdown {drawdown:.1f}% – Cleared pending trades", parse_mode='Markdown')
+            await save_trades_async(open_trades)
+            await send_throttled(CHAT_ID, f"**PAUSE:** Drawdown {drawdown:.1f}% – Cleared pending trades", parse_mode='Markdown')
         total_active = len([t for trades in [open_trades, protected_trades] for t in trades.values() if t.get('active')])
         if total_active >= MAX_CONCURRENT_TRADES:
             logging.info("Max concurrent trades reached – skipping new checks")
@@ -1238,15 +1303,19 @@ async def track_callback(context):
         for key in to_delete_protected:
             del protected_trades[key]
         if updated_keys_open or to_delete_open:
-            save_trades(open_trades)
+            await save_trades_async(open_trades)
         if updated_keys_protected or to_delete_protected:
-            save_protected(protected_trades)
+            await save_protected_async(protected_trades)
         exec_time = time.perf_counter() - start_time
         logging.info(f"Track cycle completed in {exec_time:.2f}s ({len(to_delete_open + to_delete_protected)} closes, {len(updated_keys_open + updated_keys_protected)} updates)")
     except Exception as e:
         logging.error(f"Track callback error: {e}")
         logging.info(f"Track cycle failed in {time.perf_counter() - start_time:.2f}s")
+# Updated: Authorization, throttled send
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_user.id) != CHAT_ID:
+        await update.message.reply_text("Unauthorized")
+        return
     logging.info(f"/stats triggered by user {update.effective_user.id}")
     try:
         total = stats['wins'] + stats['losses']
@@ -1267,12 +1336,16 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"**Pending:** {pending}\n"
             f"**Open:** {open_symbols}"
         )
-        await update.message.reply_text(msg, parse_mode='Markdown')
+        await send_throttled(CHAT_ID, msg, parse_mode='Markdown')
         logging.info(f"/stats sent successfully")
     except Exception as e:
         logging.error(f"/stats error: {e}")
-        await update.message.reply_text(f"Error fetching stats: {str(e)}", parse_mode='Markdown')
+        await send_throttled(CHAT_ID, f"Error fetching stats: {str(e)}", parse_mode='Markdown')
+# Updated: Authorization, throttled send
 async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_user.id) != CHAT_ID:
+        await update.message.reply_text("Unauthorized")
+        return
     logging.info(f"/health triggered by user {update.effective_user.id}")
     try:
         uptime = datetime.now(timezone.utc).isoformat()
@@ -1288,15 +1361,19 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"**Active:** {active} | **Pending:** {pending}\n"
             f"**Status:** Daily reversals: str>=2 OBs, liq sweeps, ADX anti-consol, 12h CD"
         )
-        await update.message.reply_text(msg, parse_mode='Markdown')
+        await send_throttled(CHAT_ID, msg, parse_mode='Markdown')
         logging.info(f"/health sent successfully")
     except Exception as e:
         logging.error(f"/health error: {e}")
-        await update.message.reply_text(f"Health check failed: {str(e)}", parse_mode='Markdown')
+        await send_throttled(CHAT_ID, f"Health check failed: {str(e)}", parse_mode='Markdown')
+# Updated: Authorization, throttled send
 async def recap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_user.id) != CHAT_ID:
+        await update.message.reply_text("Unauthorized")
+        return
     logging.info(f"/recap triggered by user {update.effective_user.id}")
     await daily_callback(context)
-    await update.message.reply_text("**Manual recap triggered**—check logs/messages!", parse_mode='Markdown')
+    await send_throttled(CHAT_ID, "**Manual recap triggered**—check logs/messages!", parse_mode='Markdown')
 async def daily_callback(context):
     now = datetime.now(timezone.utc)
     recap_file = RECAP_FILE
@@ -1335,16 +1412,17 @@ async def daily_callback(context):
             logging.info(f"{sym}: {change:+.2f}% @ {price:.4f}")
             await asyncio.sleep(2)
         if not text.endswith('\n'):
-            await bot.send_message(CHAT_ID, "**Recap skipped**—API ban active, try later.", parse_mode='Markdown')
+            await send_throttled(CHAT_ID, "**Recap skipped**—API ban active, try later.", parse_mode='Markdown')
             return
         text += "\nInstitutional macro recap + next 48h whale bias."
         logging.info("Calling Grok for recap...")
+        global _working_model
         payload_base = {
             "messages": [{"role": "system", "content": "You are a top institutional macro analyst. Focus on whale flows, OB structures. Respond concisely."},
                          {"role": "user", "content": text}],
             "temperature": 0.2, "max_tokens": 300
         }
-        models = ["grok-4", "grok-3"]
+        models = [_working_model, "grok-4", "grok-3"] if _working_model else ["grok-4", "grok-3"]
         recap = None
         for model in models:
             payload = payload_base.copy()
@@ -1355,6 +1433,7 @@ async def daily_callback(context):
                                      headers={"Authorization": f"Bearer {XAI_API_KEY}"})
                     r.raise_for_status()
                     recap = r.json()["choices"][0]["message"]["content"].strip()
+                    _working_model = model
                     logging.info(f"Grok recap from {model} (len: {len(recap)})")
                     if model != "grok-4":
                         logging.info(f"Daily recap fell back to {model}")
@@ -1373,9 +1452,9 @@ async def daily_callback(context):
         if recap:
             escaped_recap = html.escape(recap)
             full_msg = f"**INSTITUTIONAL DAILY SUMMARY**\n\n{escaped_recap}"
-            await bot.send_message(CHAT_ID, full_msg, parse_mode='HTML')
-            with open(recap_file, 'w') as f:
-                f.write(now.isoformat())
+            await send_throttled(CHAT_ID, full_msg, parse_mode='HTML')
+            async with aiofiles.open(recap_file, 'w') as f:  # NEW: Async write
+                await f.write(now.isoformat())
             logging.info("Daily recap sent successfully")
             await asyncio.sleep(1)
         else:
@@ -1387,7 +1466,7 @@ async def daily_callback(context):
 async def webhook_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
         logging.info(f"Webhook update: user {update.effective_user.id}, command {update.message.text}")
-# Update signal_callback: consol check, remove mini-backtest, min triggers=1, +liq
+# Update signal_callback: Per-TF consol check, throttled sends
 async def signal_callback(context):
     start_time = time.perf_counter()
     logging.info("=== Starting daily signal cycle ===")
@@ -1428,13 +1507,7 @@ async def signal_callback(context):
                 sym_time = time.perf_counter() - sym_start
                 logging.info(f"Finished {symbol} in {sym_time:.2f}s")
                 continue
-            # NEW v24.02.0: Consol check on 1d first
-            df_1d = await fetch_ohlcv(symbol, '1d')
-            if is_consolidation(df_1d):
-                logging.info(f"Skipped {symbol}: Daily consolidation")
-                sym_time = time.perf_counter() - sym_start
-                logging.info(f"Finished {symbol} in {sym_time:.2f}s")
-                continue
+            # REMOVED: Initial 1d consol check - now per-TF
             oi_data = oi_data_dict.get(symbol)
             whale_data = {'boost': 0, 'reason': ''} # Retained, but simplified - no fetch
             data = {}
@@ -1474,6 +1547,10 @@ async def signal_callback(context):
                 df = data.get(tf, pd.DataFrame())
                 if len(df) == 0:
                     continue
+                # NEW: Per-TF consol check
+                if is_consolidation(df):
+                    logging.info(f"Skipped {symbol} {tf}: Consolidation detected")
+                    continue
                 for func in [detect_pre_cross, detect_divergence, detect_macd, detect_supertrend]:
                     if r := func(df, tf):
                         triggers.add(r)
@@ -1482,7 +1559,7 @@ async def signal_callback(context):
                 triggers.update(normalized_fvgs)
                 candles = detect_candle_patterns(df, tf)
                 triggers.update(candles)
-                if len(df) > 20 and 'volume_sma' in df.columns and not pd.isna(df['volume_sma'].iloc[-1]) and df['volume'].iloc[-1] > 1.1 * df['volume_sma'].iloc[-1]: # RELAXED
+                if len(df) > 20 and 'volume_sma' in df.columns and not pd.isna(df['volume_sma'].iloc[-1]) and df['volume'].iloc[-1] > VOL_SURGE_MULTIPLIER * df['volume_sma'].iloc[-1]: # RELAXED
                     triggers.add(f"Inst Vol Surge ({tf})")
                 obs = await find_unmitigated_order_blocks(df, tf=tf, symbol=symbol)
                 raw_obs = len(obs.get('bullish', []) + obs.get('bearish', []))
@@ -1574,8 +1651,8 @@ async def signal_callback(context):
                         for key, t, dict_name, ratio in same_dir_overlaps:
                             if t.get('active') and dict_name == 'open':
                                 protected_trades[key] = open_trades.pop(key)
-                                save_trades(open_trades)
-                                save_protected(protected_trades)
+                                await save_trades_async(open_trades)
+                                await save_protected_async(protected_trades)
                                 logging.info(f"Protected active overlap for {key}")
                         merge_key, merge_t, _, _ = same_dir_overlaps[0]
                         merge_t['confidence'] = max_conf
@@ -1592,8 +1669,8 @@ async def signal_callback(context):
                                 else:
                                     del protected_trades[key]
                                 logging.info(f"Removed high-overlap {key} (ratio {ratio:.2f})")
-                        save_trades(open_trades)
-                        save_protected(protected_trades)
+                        await save_trades_async(open_trades)
+                        await save_protected_async(protected_trades)
                         last_signal_time[symbol] = now
                     else:
                         max_overlap = max(r for _, _, _, r in overlapping)
@@ -1613,7 +1690,7 @@ async def signal_callback(context):
                                 'processed': False,
                                 'strength': grok.get('strength', 2) # RELAXED
                             }
-                            save_trades(open_trades)
+                            await save_trades_async(open_trades)
                             last_signal_time[symbol] = now
                         else:
                             logging.info(f"Skipped live {symbol}: high overlap diff dir {max_overlap:.2f}")
@@ -1636,7 +1713,7 @@ async def signal_callback(context):
                         'processed': False,
                         'strength': grok.get('strength', 2)
                     }
-                    save_trades(open_trades)
+                    await save_trades_async(open_trades)
                     last_signal_time[symbol] = now
                 entry_mid = (entry_low + entry_high) / 2
                 rr1 = abs(grok['tp1'] - entry_mid) / abs(grok['sl'] - entry_mid)
@@ -1656,7 +1733,7 @@ async def signal_callback(context):
                     f"**Reason:** {grok['reason']}"
                 )
                 logging.info(f"Sending elite live for {symbol}")
-                await bot.send_message(CHAT_ID, msg, parse_mode='Markdown')
+                await send_throttled(CHAT_ID, msg, parse_mode='Markdown')
                 signals_sent += 1
             else:
                 sent_roadmap = False
@@ -1688,8 +1765,8 @@ async def signal_callback(context):
                                     for key, t, dict_name, ratio in same_dir_overlaps:
                                         if t.get('active') and dict_name == 'open':
                                             protected_trades[key] = open_trades.pop(key)
-                                            save_trades(open_trades)
-                                            save_protected(protected_trades)
+                                            await save_trades_async(open_trades)
+                                            await save_protected_async(protected_trades)
                                     merge_key, merge_t, _, _ = same_dir_overlaps[0]
                                     merge_t['confidence'] = max_conf
                                     merge_t['sl'] = min_sl
@@ -1704,8 +1781,8 @@ async def signal_callback(context):
                                                 del open_trades[key]
                                             else:
                                                 del protected_trades[key]
-                                    save_trades(open_trades)
-                                    save_protected(protected_trades)
+                                    await save_trades_async(open_trades)
+                                    await save_protected_async(protected_trades)
                                     last_signal_time[symbol] = now
                                 else:
                                     max_overlap = max(r for _, _, _, r in overlapping)
@@ -1726,7 +1803,7 @@ async def signal_callback(context):
                                             'processed': False,
                                             'strength': z['strength']
                                         }
-                                        save_trades(open_trades)
+                                        await save_trades_async(open_trades)
                                         last_signal_time[symbol] = now
                                         logging.info(f"Added elite roadmap trade for {symbol}: {z['direction']} {new_conf}% str{z['strength']}")
                                     else:
@@ -1749,7 +1826,7 @@ async def signal_callback(context):
                                     'processed': False,
                                     'strength': z['strength']
                                 }
-                                save_trades(open_trades)
+                                await save_trades_async(open_trades)
                                 last_signal_time[symbol] = now
                                 logging.info(f"Added elite roadmap trade for {symbol}: {z['direction']} {new_conf}% str{z['strength']}")
                             entry_mid = (z['entry_low'] + z['entry_high']) / 2
@@ -1760,7 +1837,7 @@ async def signal_callback(context):
                             conservative_msg += f"**Reason:** {z['reason']} ( {z['dist_pct']:.1f}% away, str{z['strength']} )\n\n"
                     if roadmap_count > 0:
                         logging.info(f"Sending elite roadmap for {symbol}")
-                        await bot.send_message(CHAT_ID, conservative_msg, parse_mode='Markdown')
+                        await send_throttled(CHAT_ID, conservative_msg, parse_mode='Markdown')
                         last_signal_time[symbol] = now
                         sent_roadmap = True
                         signals_sent += 1
@@ -1769,7 +1846,7 @@ async def signal_callback(context):
                     if is_alt and btc_trend: trigger_msg += f" | *BTC:* {btc_trend}"
                     trigger_msg += "\n\n__Inst signals:__\n" + '\n'.join([f"• {t}" for t in sorted(strong_triggers[:6])])
                     logging.info(f"Sending elite triggers for {symbol}: {len(strong_triggers)}")
-                    await bot.send_message(CHAT_ID, trigger_msg, parse_mode='Markdown')
+                    await send_throttled(CHAT_ID, trigger_msg, parse_mode='Markdown')
                     last_signal_time[symbol] = now
                     sent_roadmap = True
                     signals_sent += 1
@@ -1797,7 +1874,7 @@ async def signal_callback(context):
                 last_watch_time[symbol] = now
                 logging.info(f"Watch levels sent for {symbol}")
             if len(watch_msg) > 50:
-                await bot.send_message(CHAT_ID, watch_msg, parse_mode='Markdown')
+                await send_throttled(CHAT_ID, watch_msg, parse_mode='Markdown')
                 logging.info("Levels to Watch message sent")
         total_time = time.perf_counter() - start_time
         logging.info(f"=== Daily signal cycle complete in {total_time:.2f}s ===")
@@ -1836,8 +1913,8 @@ async def post_init(application: Application) -> None:
     logging.info("Post_init complete – Daily signals via job in ~60s.")
 def main():
     global background_task # NEW: Access global for cleanup
-    # Env debug logs
-    logging.info(f"Loaded env: TOKEN={TELEGRAM_TOKEN[:5] if TELEGRAM_TOKEN else 'MISSING'}..., CHAT={CHAT_ID if CHAT_ID else 'MISSING'}, KEY={XAI_API_KEY[:5] if XAI_API_KEY else 'MISSING'}...")
+    # FIXED: Redacted keys
+    logging.info(f"Loaded env: TOKEN={'SET' if TELEGRAM_TOKEN else 'MISSING'}, CHAT={'SET' if CHAT_ID else 'MISSING'}, KEY={'SET' if XAI_API_KEY else 'MISSING'}")
     if not all([TELEGRAM_TOKEN, CHAT_ID, XAI_API_KEY]):
         logging.error("Missing required env vars: TELEGRAM_TOKEN, CHAT_ID, XAI_API_KEY")
         sys.exit(1)
