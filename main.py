@@ -1,5 +1,6 @@
-# main.py - Grok Elite Signal Bot v24.02.0 - Daily Reversal Hunter: OB str2/3 + Liquidity Sweeps (Anti-Consol Edition)
-# UPGRADE (v24.02.0): Daily focus (1d prio); OB str2/3; liquidity sweeps as bounces; ADX consol filter (<25 skip); vol>1.1x, conf>=70%, dist<7%; simplified Grok/whale; more signals ~2x.
+# main.py - Grok Elite Signal Bot v24.02.1 - Daily Reversal Hunter: OB str2/3 + Liquidity Sweeps (Anti-Consol Edition) + Levels to Watch
+# UPGRADE (v24.02.1): Added 'Levels to Watch' - Grok 1d analysis (OB/POC/liq) if no signals in cycle; 24h cooldown/symbol; only on quiet cycles.
+# Retained v24.02.0: Daily focus (1d prio); OB str2/3; liquidity sweeps as bounces; ADX consol filter (<25 skip); vol>1.1x, conf>=70%, dist<7%; simplified Grok/whale; more signals ~2x.
 # Retained v24.01.8: Order Flow enhanced; relaxed thresholds.
 import asyncio
 import os
@@ -18,13 +19,13 @@ from typing import Dict, Any, Optional, List
 import time
 from collections import OrderedDict
 import html
-import sys  # For explicit exit in main()
-
+import sys # For explicit exit in main()
 SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT']
 TIMEFRAMES = ['4h', '1d', '1w']
-CHECK_INTERVAL = 7200  # NEW v24.02.0: 2h for more checks
+CHECK_INTERVAL = 7200 # NEW v24.02.0: 2h for more checks
 TRACK_INTERVAL = 5
 COOLDOWN_HOURS = 12
+WATCH_COOLDOWN_HOURS = 24
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 XAI_API_KEY = os.getenv("XAI_API_KEY")
@@ -50,7 +51,7 @@ BACKTEST_FILE = "backtest_results.json"
 CACHE_TTL = 1800
 HTF_CACHE_TTL = 3600
 TICKER_CACHE_TTL = 10
-ORDER_FLOW_CACHE_TTL = 5  # Short TTL for fresh book
+ORDER_FLOW_CACHE_TTL = 5 # Short TTL for fresh book
 MAX_CACHE_SIZE = 50
 ohlcv_cache: OrderedDict = OrderedDict()
 ticker_cache: OrderedDict = OrderedDict()
@@ -59,6 +60,7 @@ last_oi: Dict[str, float] = {}
 open_trades = {}
 protected_trades = {}
 last_signal_time = {}
+last_watch_time = {}
 prices_global: Dict[str, Optional[float]] = {s: None for s in SYMBOLS}
 last_price_update: float = 0.0
 last_ban_check: float = 0.0
@@ -75,16 +77,14 @@ DAILY_ATR_MULT = 2.0
 SIMULATED_CAPITAL = 10000.0
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 fetch_sem = asyncio.Semaphore(3)
-
 def evict_if_full(cache: OrderedDict, max_size: int = MAX_CACHE_SIZE):
     """Evict oldest cache entries if size exceeds limit to prevent memory growth."""
     evicted = 0
     while len(cache) > max_size:
-        cache.popitem(last=False)  # FIFO: oldest first
+        cache.popitem(last=False) # FIFO: oldest first
         evicted += 1
     if evicted > 0:
         logging.debug(f"Evicted {evicted} items from {cache.__class__.__name__} cache (now {len(cache)} items)")
-
 class BanManager:
     ban_until: float = 0.0
     cooldown_until: float = 0.0
@@ -119,7 +119,6 @@ class BanManager:
         cls.ban_until = ban_ts_ms / 1000.0
         cls.cooldown_until = cls.ban_until + 3600
         logging.warning(f"Global ban updated: until {datetime.fromtimestamp(cls.ban_until).isoformat()} (+1h cooldown)")
-
 def load_stats() -> Dict[str, Any]:
     if os.path.exists(STATS_FILE):
         try:
@@ -131,17 +130,14 @@ def load_stats() -> Dict[str, Any]:
         except json.JSONDecodeError:
             logging.warning("Invalid stats file, resetting.")
     return {"wins": 0, "losses": 0, "pnl": 0.0, "capital": SIMULATED_CAPITAL, "drawdown": 0.0}
-
 def save_stats(s: Dict[str, Any]):
     try:
         with open(STATS_FILE, 'w') as f:
             json.dump(s, f, indent=2)
     except Exception as e:
         logging.error(f"Failed to save stats: {e}")
-
 stats = load_stats()
 stats_lock = asyncio.Lock()
-
 def load_trades() -> Dict[str, Any]:
     if os.path.exists(TRADES_FILE):
         try:
@@ -158,7 +154,6 @@ def load_trades() -> Dict[str, Any]:
         except (json.JSONDecodeError, KeyError) as e:
             logging.warning(f"Invalid trades file, resetting: {e}")
     return {}
-
 def save_trades(trades: Dict[str, Any]):
     try:
         dumpable = {}
@@ -173,7 +168,6 @@ def save_trades(trades: Dict[str, Any]):
             json.dump(dumpable, f, indent=2)
     except Exception as e:
         logging.error(f"Failed to save trades: {e}")
-
 def load_protected() -> Dict[str, Any]:
     if os.path.exists(PROTECTED_TRADES_FILE):
         try:
@@ -190,7 +184,6 @@ def load_protected() -> Dict[str, Any]:
         except (json.JSONDecodeError, KeyError) as e:
             logging.warning(f"Invalid protected trades file, resetting: {e}")
     return {}
-
 def save_protected(trades: Dict[str, Any]):
     try:
         dumpable = {}
@@ -205,16 +198,12 @@ def save_protected(trades: Dict[str, Any]):
             json.dump(dumpable, f, indent=2)
     except Exception as e:
         logging.error(f"Failed to save protected trades: {e}")
-
 open_trades = load_trades()
 protected_trades = load_protected()
-
 def get_clean_symbol(trade_key: str) -> str:
     return re.sub(r'roadmap\d+$', '', trade_key)
-
 def format_price(price: float) -> str:
     return f"{price:,.4f}"
-
 # Order Flow: Fetch batch order books (enhanced for walls)
 async def fetch_order_flow_batch() -> Dict[str, Dict]:
     async with fetch_sem:
@@ -231,7 +220,7 @@ async def fetch_order_flow_batch() -> Dict[str, Dict]:
         backoff = 1
         for attempt in range(3):
             try:
-                tasks = [exchange.fetch_order_book(s, limit=20) for s in SYMBOLS]  # NEW v24.02.0: limit=20 for deeper walls
+                tasks = [exchange.fetch_order_book(s, limit=20) for s in SYMBOLS] # NEW v24.02.0: limit=20 for deeper walls
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 for i, result in enumerate(results):
                     if not isinstance(result, Exception):
@@ -249,13 +238,12 @@ async def fetch_order_flow_batch() -> Dict[str, Dict]:
         else:
             order_books = {s: order_flow_cache.get(s, {}).get('book') for s in SYMBOLS}
         return order_books
-
 # NEW v24.02.0: Enhanced Order Flow - delta, footprint + walls/sweeps
 def calculate_order_flow(df: pd.DataFrame, order_book: Optional[Dict] = None) -> pd.DataFrame:
     if len(df) == 0 or not order_book:
         return df
     df = df.copy()
-    bids = order_book.get('bids', [])[:5]  # Top 5 for walls
+    bids = order_book.get('bids', [])[:5] # Top 5 for walls
     asks = order_book.get('asks', [])[:5]
     buy_vol = sum(amount for _, amount in bids)
     sell_vol = sum(amount for _, amount in asks)
@@ -277,26 +265,24 @@ def calculate_order_flow(df: pd.DataFrame, order_book: Optional[Dict] = None) ->
     current_close = df['close'].iloc[-1]
     current_high = df['high'].iloc[-1]
     current_low = df['low'].iloc[-1]
-    sweep_high = current_high > recent_high and current_close < current_high * 0.999  # Reversal after sweep
+    sweep_high = current_high > recent_high and current_close < current_high * 0.999 # Reversal after sweep
     sweep_low = current_low < recent_low and current_close > current_low * 1.001
-    df['liq_sweep'] = (sweep_high or sweep_low)  # Bool for bounce potential
+    df['liq_sweep'] = (sweep_high or sweep_low) # Bool for bounce potential
     df['liq_sweep'] = df['liq_sweep'].fillna(sweep_high or sweep_low)
     logging.debug(f"Order flow: delta {delta:.2f}% | Wall: {wall_imbalance} | Footprint: {active_levels} | Sweep: {sweep_high or sweep_low}")
     return df
-
 # NEW v24.02.0: Consolidation filter with ADX
 def is_consolidation(df: pd.DataFrame) -> bool:
     if len(df) < 14:
-        return True  # Default safe
+        return True # Default safe
     adx = ta.adx(df['high'], df['low'], df['close'], length=14)
     if adx is None or 'ADX_14' not in adx.columns:
         return False
     adx_val = adx['ADX_14'].iloc[-1]
     vol_ratio = df['volume'].iloc[-1] / df['volume'].rolling(20).mean().iloc[-1]
-    consol = (adx_val < 25) and (vol_ratio < 1.1)  # Low trend + low vol = consol
+    consol = (adx_val < 25) and (vol_ratio < 1.1) # Low trend + low vol = consol
     logging.info(f"Consol check: ADX={adx_val:.1f}, vol_ratio={vol_ratio:.2f} -> {consol}")
     return consol
-
 async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logging.info(f"/backtest triggered by user {update.effective_user.id}")
     try:
@@ -315,9 +301,9 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             df_slice = df.iloc[:i+1]
             if is_consolidation(df_slice):
                 continue
-            if (df['ema50'].iloc[i] > df['ema200'].iloc[i] and  # EMA200 bias
+            if (df['ema50'].iloc[i] > df['ema200'].iloc[i] and # EMA200 bias
                 df['ema50'].iloc[i-1] <= df['ema100'].iloc[i-1] and
-                df['volume'].iloc[i] > 1.1 * df['volume_sma'].iloc[i]):  # RELAXED vol
+                df['volume'].iloc[i] > 1.1 * df['volume_sma'].iloc[i]): # RELAXED vol
                 entry = df['close'].iloc[i]
                 sl = entry * 0.98
                 tp = entry * 1.06
@@ -340,7 +326,7 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pnl_usdt = diff * size - 2 * FEE_PCT * entry * size
                     trades.append({'result': 'open', 'pnl': pnl_usdt})
             # Short: symmetric, with consol skip
-            if df['ema200'].iloc[i] > df['close'].iloc[i]:  # Bias below for short
+            if df['ema200'].iloc[i] > df['close'].iloc[i]: # Bias below for short
                 continue
             elif (df['ema50'].iloc[i] < df['ema100'].iloc[i] and
                   df['ema50'].iloc[i-1] >= df['ema100'].iloc[i-1] and
@@ -380,12 +366,12 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"/backtest error: {e}")
         await update.message.reply_text(f"Backtest failed: {str(e)}", parse_mode='Markdown')
-
 async def send_welcome_once():
     if not os.path.exists(FLAG_FILE):
         try:
             welcome_text = (
-                "**Grok Elite Bot v24.02.0 ONLINE ♔** – Daily Reversal Hunter: OB str2/3 + Liq Sweeps (Anti-Consol)\n\n"
+                "**Grok Elite Bot v24.02.1 ONLINE ♔** – Daily Reversal Hunter: OB str2/3 + Liq Sweeps (Anti-Consol) + Levels to Watch\n\n"
+                "• v24.02.1: Levels to Watch (Grok 1d OB/POC/liq analysis on quiet cycles, 24h CD/symbol).\n"
                 "• v24.02.0: Daily 1d focus; str>=2 OBs; liq sweeps as bounces; ADX consol skip; vol>1.1x, conf>=70%, dist<7%; ~2x more signals.\n"
                 "• Retained: Order Flow walls/delta; relaxed thresholds.\n"
                 "• All: ICT daily, reversals prio, no range noise."
@@ -393,10 +379,9 @@ async def send_welcome_once():
             escaped_text = html.escape(welcome_text)
             await bot.send_message(CHAT_ID, escaped_text, parse_mode='HTML')
             open(FLAG_FILE, "w").close()
-            logging.info("Welcome sent (v24.02.0)")
+            logging.info("Welcome sent (v24.02.1)")
         except Exception as e:
             logging.error(f"Failed to send welcome: {e}")
-
 async def query_grok_instant(context: str, is_alt: bool = False) -> Dict[str, Any]:
     models = ["grok-4", "grok-3"]
     example_json = r'{"symbol":"BTC","direction":"Long" or "Short","entry_low":68234.5678,"entry_high":68456.1234,"sl":67987.2345,"tp1":68890.7890,"tp2":69543.4567,"leverage":3-7,"confidence":70-98,"strength":2,"reason":"concise daily reason (max 80 chars, e.g., HTF OB + vol on 1d)"}'
@@ -444,7 +429,6 @@ async def query_grok_instant(context: str, is_alt: bool = False) -> Dict[str, An
             if model == models[-1]:
                 return {"error": str(e)}
     return {"error": "All models failed"}
-
 def check_precision(trade: Dict[str, Any]) -> bool:
     price_keys = ['entry_low', 'entry_high', 'sl', 'tp1', 'tp2']
     for key in price_keys:
@@ -454,16 +438,14 @@ def check_precision(trade: Dict[str, Any]) -> bool:
                 logging.warning(f"Precision fail: {key}={p} too round")
                 return False
     return True
-
 def check_rr(trade: Dict[str, Any]) -> bool:
     entry_mid = (trade['entry_low'] + trade['entry_high']) / 2
     rr2 = abs(trade['tp2'] - entry_mid) / abs(trade['sl'] - entry_mid)
     return rr2 >= 2.0
-
 # Update query_grok_potential: Simplified prompt, focus daily/OB/liquidity
 async def query_grok_potential(zones: List[Dict], symbol: str, current_price: float, trend: str, btc_trend: Optional[str], atr: float = 0) -> Dict[str, Any]:
     is_alt = symbol != 'BTC/USDT'
-    filtered_zones = [z for z in zones if z.get('strength', 0) >= 2 and z.get('prob', 0) >= 70]  # RELAXED v24.02.0
+    filtered_zones = [z for z in zones if z.get('strength', 0) >= 2 and z.get('prob', 0) >= 70] # RELAXED v24.02.0
     if not filtered_zones:
         return {"no_live_trade": True, "roadmap": []}
     zone_summary = "\n".join([f"{z['direction']}: {z['zone_low']:.4f}-{z['zone_high']:.4f} ({z['confluence']}, {z['prob']}% prob, {z['dist_pct']:.1f}% away, str{z['strength']})" for z in filtered_zones])
@@ -482,7 +464,7 @@ async def query_grok_potential(zones: List[Dict], symbol: str, current_price: fl
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": context}
             ],
-            "temperature": 0.1,  # Slightly higher for variety
+            "temperature": 0.1, # Slightly higher for variety
             "max_tokens": 400
         }
         attempt = 0
@@ -498,7 +480,7 @@ async def query_grok_potential(zones: List[Dict], symbol: str, current_price: fl
                         precise = False
                     if 'roadmap' in result:
                         for z in result['roadmap']:
-                            if (not check_precision(z) or not check_rr(z) or z.get('strength', 0) < 2 or z.get('confidence', 0) < 70):  # RELAXED
+                            if (not check_precision(z) or not check_rr(z) or z.get('strength', 0) < 2 or z.get('confidence', 0) < 70): # RELAXED
                                 precise = False
                                 break
                     if precise:
@@ -517,7 +499,46 @@ async def query_grok_potential(zones: List[Dict], symbol: str, current_price: fl
         if attempt == 2:
             continue
     return {"error": "All models failed"}
-
+async def query_grok_watch_levels(symbol: str, price: float, trend: str, btc_trend: Optional[str], data: Dict[str, pd.DataFrame], oi_data: Optional[Dict[str, float]]) -> str:
+    is_alt = symbol != 'BTC/USDT'
+    df_1d = data.get('1d', pd.DataFrame())
+    obs = await find_unmitigated_order_blocks(df_1d, tf='1d', symbol=symbol)
+    poc = max(calc_liquidity_profile(df_1d).items(), key=lambda x: x[1])[0] if len(df_1d) > 0 else None
+    level_summary = ""
+    for ob_type in ['bullish', 'bearish']:
+        for ob in obs.get(ob_type, [])[:2]:
+            mid = (ob['low'] + ob['high']) / 2
+            level_summary += f"{ob_type.capitalize()} OB: {mid:.4f} (str{ob['strength']}); "
+    oi_str = f"OI change: {oi_data['oi_change_pct']:.1f}%" if oi_data else "No OI data"
+    context = f"{symbol} | Price: {price:.4f} | Trend: {trend} {'| BTC: ' + btc_trend if is_alt else ''}\nLevels: {level_summary} | POC: {poc:.4f if poc else 'N/A'} | {oi_str}\nAnalyze key 1d levels to watch (OB/liq/POC), why (confluence), potential trade plan (bias/entry/SL/TP outline, max 50 chars per level)."
+    system_prompt = (
+        "You are ICT daily analyst. Output ONLY concise text: 'Watch [level1] ([why1]) – Plan: [plan1]; [level2] ([why2]) – Plan: [plan2]'. "
+        "Focus 1d OB str>=2, liq sweeps, POC. 2-3 levels max. Bias from trend. No spam, precise prices."
+        f"Alts: BTC align."
+    )
+    models = ["grok-4", "grok-3"]
+    for model in models:
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": context}
+            ],
+            "temperature": 0.2,
+            "max_tokens": 200
+        }
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.post("https://api.x.ai/v1/chat/completions", json=payload, headers={"Authorization": f"Bearer {XAI_API_KEY}"})
+                r.raise_for_status()
+                content = r.json()["choices"][0]["message"]["content"].strip()
+                if len(content) > 10:
+                    return content
+        except Exception as e:
+            logging.error(f"Watch levels Grok error with {model} for {symbol}: {e}")
+            if model == models[-1]:
+                return f"No analysis for {symbol.replace('/USDT','')} – market quiet."
+    return f"No analysis for {symbol.replace('/USDT','')} – market quiet."
 async def fetch_open_interest(symbol: str) -> Optional[Dict[str, float]]:
     async with fetch_sem:
         if await BanManager.check_and_sleep():
@@ -550,7 +571,6 @@ async def fetch_open_interest(symbol: str) -> Optional[Dict[str, float]]:
             logging.error(f"OI fetch error for {symbol}: {e}")
             await asyncio.sleep(5)
             return None
-
 async def fetch_ohlcv(symbol: str, tf: str, limit: int = 200, since: Optional[int] = None) -> pd.DataFrame:
     async with fetch_sem:
         if await BanManager.check_and_sleep():
@@ -592,7 +612,6 @@ async def fetch_ohlcv(symbol: str, tf: str, limit: int = 200, since: Optional[in
         sleep_time = 3 if success else 5
         await asyncio.sleep(sleep_time)
         return ohlcv_cache.get(cache_key, {}).get('df', pd.DataFrame())
-
 async def fetch_ticker_batch() -> Dict[str, Optional[float]]:
     async with fetch_sem:
         now = time.time()
@@ -628,11 +647,9 @@ async def fetch_ticker_batch() -> Dict[str, Optional[float]]:
         else:
             prices = {s: ticker_cache.get(s, {}).get('price') for s in SYMBOLS}
         return prices
-
 async def fetch_ticker(symbol: str) -> Optional[float]:
     prices = await fetch_ticker_batch()
     return prices.get(symbol)
-
 async def price_background_task():
     """Background task: Polls tickers and order flow every 10s for fresh prices/data."""
     while True:
@@ -648,7 +665,6 @@ async def price_background_task():
         except Exception as e:
             logging.warning(f"Background poll error (retrying): {e}")
             await asyncio.sleep(5)
-
 def add_indicators(df: pd.DataFrame, order_book: Optional[Dict] = None) -> pd.DataFrame:
     if len(df) == 0:
         return df
@@ -681,11 +697,10 @@ def add_indicators(df: pd.DataFrame, order_book: Optional[Dict] = None) -> pd.Da
         df['vwap'] = ta.vwap(df['high'], df['low'], df['close'], df['volume'])
     # Order Flow: Calculate delta/footprint/sweep
     df = calculate_order_flow(df, order_book)
-    key_cols = ['ema50', 'ema100', 'rsi', 'volume_sma', 'macd', 'macd_signal', 'supertrend_dir', 'vwap', 'ema200', 'order_delta', 'cum_delta', 'liq_sweep']  # NEW: + liq_sweep
+    key_cols = ['ema50', 'ema100', 'rsi', 'volume_sma', 'macd', 'macd_signal', 'supertrend_dir', 'vwap', 'ema200', 'order_delta', 'cum_delta', 'liq_sweep'] # NEW: + liq_sweep
     subset_key = [col for col in key_cols if col in df.columns]
     df = df.dropna(subset=subset_key)
     return df
-
 def zones_overlap(z1_low: float, z1_high: float, z2_low: float, z2_high: float, threshold: float = 0.5) -> float:
     o_low = max(z1_low, z2_low)
     o_high = min(z1_high, z2_high)
@@ -694,7 +709,6 @@ def zones_overlap(z1_low: float, z1_high: float, z2_low: float, z2_high: float, 
     overlap_len = o_high - o_low
     min_width = min(z1_high - z1_low, z2_high - z2_low)
     return (overlap_len / min_width)
-
 # Update find_unmitigated_order_blocks: Allow str=2
 async def find_unmitigated_order_blocks(df: pd.DataFrame, lookback: int = 100, atr_mult: float = 2.0, tf: str = None, symbol: str = None) -> Dict[str, List[Dict]]:
     if len(df) < 30:
@@ -706,7 +720,7 @@ async def find_unmitigated_order_blocks(df: pd.DataFrame, lookback: int = 100, a
     df_local['direction'] = np.where(df_local['close'] > df_local['open'], 1, -1)
     df_local['swing_high'] = df_local['high'].rolling(10, center=True).max() == df_local['high']
     df_local['swing_low'] = df_local['low'].rolling(10, center=True).min() == df_local['low']
-    df_local['vol_surge'] = df_local['volume'] > 1.1 * df_local['volume'].rolling(20).mean()  # RELAXED v24.02.0: 1.1x
+    df_local['vol_surge'] = df_local['volume'] > 1.1 * df_local['volume'].rolling(20).mean() # RELAXED v24.02.0: 1.1x
     logging.info(f"Vol surge detected: {sum(df_local['vol_surge'])} in {len(df_local)} bars")
     df_local['volume_sma'] = df_local['volume'].rolling(20).mean()
     obs = {'bullish': [], 'bearish': []}
@@ -718,8 +732,8 @@ async def find_unmitigated_order_blocks(df: pd.DataFrame, lookback: int = 100, a
             if move_down and abs((ob_low - df_local['low'].iloc[i+5:i+10].min()) / ob_low) > 0.02:
                 mitigated = any(df_local['high'].iloc[i+1:] > ob_high)
                 zone_type = 'Breaker' if any(df_local['low'].iloc[i+1:i+6] < ob_low) else 'OB'
-                strength = 3 if zone_type == 'OB' and df_local['volume'].iloc[i] > 1.1 * df_local['volume_sma'].iloc[i] else 2  # NEW v24.02.0: str=2 allowed
-                if not mitigated and strength >= 2:  # RELAXED: >=2
+                strength = 3 if zone_type == 'OB' and df_local['volume'].iloc[i] > 1.1 * df_local['volume_sma'].iloc[i] else 2 # NEW v24.02.0: str=2 allowed
+                if not mitigated and strength >= 2: # RELAXED: >=2
                     obs['bearish'].append({
                         'low': ob_low, 'high': ob_high, 'type': zone_type,
                         'strength': strength, 'index': i, 'mitigated': False
@@ -732,8 +746,8 @@ async def find_unmitigated_order_blocks(df: pd.DataFrame, lookback: int = 100, a
             if move_up and abs((df_local['high'].iloc[i+5:i+10].max() - ob_high) / ob_high) > 0.02:
                 mitigated = any(df_local['low'].iloc[i+1:] < ob_low)
                 zone_type = 'Breaker' if any(df_local['high'].iloc[i+1:i+6] > ob_high) else 'OB'
-                strength = 3 if zone_type == 'OB' and df_local['volume'].iloc[i] > 1.1 * df_local['volume_sma'].iloc[i] else 2  # NEW: str=2
-                if not mitigated and strength >= 2:  # RELAXED
+                strength = 3 if zone_type == 'OB' and df_local['volume'].iloc[i] > 1.1 * df_local['volume_sma'].iloc[i] else 2 # NEW: str=2
+                if not mitigated and strength >= 2: # RELAXED
                     obs['bullish'].append({
                         'low': ob_low, 'high': ob_high, 'type': zone_type,
                         'strength': strength, 'index': i, 'mitigated': False
@@ -757,13 +771,12 @@ async def find_unmitigated_order_blocks(df: pd.DataFrame, lookback: int = 100, a
                                 'strength': merged_strength, 'index': ob_htf['index'], 'mitigated': False
                             })
                             logging.info(f"Merged {ob_type} OB for {symbol} {tf}: overlap {overlap_ratio:.2f}")
-                obs[ob_type] = merged[:3]  # NEW v24.02.0: Up to 3 for more options
+                obs[ob_type] = merged[:3] # NEW v24.02.0: Up to 3 for more options
         except Exception as e:
             logging.warning(f"HTF 1h verify failed for {symbol} {tf}: {e}")
     for key in obs:
-        obs[key] = sorted(obs[key], key=lambda z: (len(df_local) - z['index']) * z['strength'], reverse=True)[:3]  # NEW: [:3]
+        obs[key] = sorted(obs[key], key=lambda z: (len(df_local) - z['index']) * z['strength'], reverse=True)[:3] # NEW: [:3]
     return obs
-
 # Update find_next_premium_zones: str>=2, liq sweep boost, consol skip
 async def find_next_premium_zones(df: pd.DataFrame, current_price: float, tf: str, symbol: str = None, oi_data: Optional[Dict[str, float]] = None, trend: str = None, whale_data: Optional[Dict[str, Any]] = None, order_book: Optional[Dict] = None) -> List[Dict]:
     if len(df) < 50:
@@ -804,19 +817,19 @@ async def find_next_premium_zones(df: pd.DataFrame, current_price: float, tf: st
             l4h = df_4h.iloc[-1]
             if (l4h['ema50'] > l4h['ema100'] and tf_trend == 'Uptrend') or (l4h['ema50'] < l4h['ema100'] and tf_trend == 'Downtrend'):
                 htf_align += 1.5
-    htf_mult = htf_align if tf == '1d' else 1.0  # NEW v24.02.0: Stronger 1d mult
+    htf_mult = htf_align if tf == '1d' else 1.0 # NEW v24.02.0: Stronger 1d mult
     obs = await find_unmitigated_order_blocks(df, tf=tf, symbol=symbol)
-    elite_obs = {k: [o for o in v if o['strength'] >= 2] for k, v in obs.items()}  # RELAXED v24.02.0: >=2
+    elite_obs = {k: [o for o in v if o['strength'] >= 2] for k, v in obs.items()} # RELAXED v24.02.0: >=2
     liq_profile = calc_liquidity_profile(df)
     poc = max(liq_profile.items(), key=lambda x: x[1])[0] if liq_profile else None
-    zones_7pct = []  # RELAXED: 7%
-    buffer_mult = 0.05 if trend == 'Downtrend' else 0.07  # RELAXED
+    zones_7pct = [] # RELAXED: 7%
+    buffer_mult = 0.05 if trend == 'Downtrend' else 0.07 # RELAXED
     long_buffer = current_price * buffer_mult
     short_buffer = current_price * buffer_mult
     for ob in elite_obs.get('bullish', []):
         mid = (ob['low'] + ob['high']) / 2
         dist_pct = abs(current_price - mid) / current_price * 100
-        if mid < current_price - long_buffer and dist_pct <= 7.0:  # RELAXED
+        if mid < current_price - long_buffer and dist_pct <= 7.0: # RELAXED
             zones_7pct.append(ob)
     for ob in elite_obs.get('bearish', []):
         mid = (ob['low'] + ob['high']) / 2
@@ -829,7 +842,7 @@ async def find_next_premium_zones(df: pd.DataFrame, current_price: float, tf: st
     for ob in zones_to_use:
         mid = (ob['low'] + ob['high']) / 2
         dist = abs(current_price - mid) / current_price * 100
-        conf_score = ob['strength'] * htf_mult  # str2 = lower base
+        conf_score = ob['strength'] * htf_mult # str2 = lower base
         confluence_str = ob['type']
         if poc and abs(mid - poc) / current_price * 100 < 0.3:
             conf_score += 2
@@ -875,7 +888,7 @@ async def find_next_premium_zones(df: pd.DataFrame, current_price: float, tf: st
         else:
             reversal_caution = False
         aligned_bias = 'bull' if direction == 'Long' else 'bear'
-        if trend_bias != 'neutral' and trend_bias != aligned_bias and not reversal_caution:  # Skip counter-trend without confirm
+        if trend_bias != 'neutral' and trend_bias != aligned_bias and not reversal_caution: # Skip counter-trend without confirm
             logging.info(f"Skipped counter-trend {direction} for {symbol} {tf}: bias {trend_bias}, no caution")
             continue
         # Order Flow boosts (retained + sweep)
@@ -891,19 +904,18 @@ async def find_next_premium_zones(df: pd.DataFrame, current_price: float, tf: st
             conf_score += 2
             confluence_str += "+Liq Sweep Bounce"
             logging.info(f"Liq sweep bounce boost for {symbol} {direction}")
-        prob = min(98, 60 + conf_score * 7)  # RELAXED v24.02.0: base 60, *7 for more
+        prob = min(98, 60 + conf_score * 7) # RELAXED v24.02.0: base 60, *7 for more
         direction = 'Long' if 'bullish' in str(ob.get('type', '')) else 'Short'
         zones.append({
             'direction': direction, 'zone_low': ob['low'], 'zone_high': ob['high'],
             'confluence': confluence_str, 'dist_pct': dist, 'prob': prob, 'strength': ob['strength']
         })
-    zones = sorted(zones, key=lambda z: z['dist_pct'])[:3]  # NEW: Up to 3
-    zones = [z for z in zones if z['prob'] >= 70]  # RELAXED: 70%
+    zones = sorted(zones, key=lambda z: z['dist_pct'])[:3] # NEW: Up to 3
+    zones = [z for z in zones if z['prob'] >= 70] # RELAXED: 70%
     if len(zones) < 2 and tf not in ['1w']:
         zones = []
     logging.info(f"Filtered to {len(zones)} elite zones >=70% for {symbol} {tf}")
     return zones
-
 def calc_liquidity_profile(df: pd.DataFrame, bins: int = 15) -> Dict[float, float]:
     if len(df) < 50:
         return {}
@@ -924,7 +936,6 @@ def calc_liquidity_profile(df: pd.DataFrame, bins: int = 15) -> Dict[float, floa
     else:
         hot_zones = {k: v / threshold if v > threshold else 0 for k, v in vol_profile.items()}
     return hot_zones
-
 def detect_supertrend(df: pd.DataFrame, tf: str) -> Optional[str]:
     if len(df) < 11 or 'supertrend_dir' not in df.columns or pd.isna(df['supertrend_dir'].iloc[-1]):
         return None
@@ -933,7 +944,6 @@ def detect_supertrend(df: pd.DataFrame, tf: str) -> Optional[str]:
     if df['supertrend_dir'].iloc[-1] == -1 and df['supertrend_dir'].iloc[-2] == 1:
         return f"SuperTrend Bearish Flip ({tf})"
     return None
-
 def detect_fvg(df: pd.DataFrame, tf: str, lookback: int = 50, proximity_pct: float = 0.3) -> List[str]:
     if len(df) < 5:
         return []
@@ -956,7 +966,6 @@ def detect_fvg(df: pd.DataFrame, tf: str, lookback: int = 50, proximity_pct: flo
             if dist_pct < proximity_pct:
                 fvgs.append(f"Near Bearish FVG {dist_pct:.1f}% away ({tf})")
     return fvgs
-
 def detect_macd(df: pd.DataFrame, tf: str) -> Optional[str]:
     if len(df) < 2 or 'macd' not in df.columns or 'macd_signal' not in df.columns or pd.isna(df['macd'].iloc[-1]) or pd.isna(df['macd_signal'].iloc[-1]):
         return None
@@ -965,7 +974,6 @@ def detect_macd(df: pd.DataFrame, tf: str) -> Optional[str]:
     if df['macd'].iloc[-1] < df['macd_signal'].iloc[-1] and df['macd'].iloc[-2] >= df['macd_signal'].iloc[-2]:
         return f"Bearish MACD Crossover ({tf})"
     return None
-
 def detect_pre_cross(df: pd.DataFrame, tf: str) -> Optional[str]:
     if len(df) < 2 or tf not in ['4h', '1d'] or 'ema50' not in df.columns or 'ema100' not in df.columns or pd.isna(df['ema50'].iloc[-1]) or pd.isna(df['ema100'].iloc[-1]):
         return None
@@ -974,7 +982,6 @@ def detect_pre_cross(df: pd.DataFrame, tf: str) -> Optional[str]:
     if diff < 0.005:
         return "Golden Cross Incoming" if l['ema50'] > l['ema100'] else "Death Cross Incoming"
     return None
-
 def detect_divergence(df: pd.DataFrame, tf: str) -> Optional[str]:
     if len(df) < 50 or tf not in ['4h', '1d'] or 'rsi' not in df.columns or pd.isna(df['rsi'].iloc[-1]):
         return None
@@ -993,7 +1000,6 @@ def detect_divergence(df: pd.DataFrame, tf: str) -> Optional[str]:
     if price.iloc[-1] > price.loc[swing_high_idx] and rsi.iloc[-1] < rsi.loc[swing_high_idx] and rsi.iloc[-1] > 75:
         return f"Bearish RSI Divergence ({tf})"
     return None
-
 def detect_candle_patterns(df: pd.DataFrame, tf: str) -> List[str]:
     if len(df) < 3:
         return []
@@ -1003,7 +1009,7 @@ def detect_candle_patterns(df: pd.DataFrame, tf: str) -> List[str]:
     upper = c['high'] - max(c['open'], c['close'])
     lower = min(c['open'], c['close']) - c['low']
     range_size = c['high'] - c['low']
-    if body > 0.7 * range_size and df['volume'].iloc[-1] > 1.1 * df['volume_sma'].iloc[-1]:  # RELAXED vol
+    if body > 0.7 * range_size and df['volume'].iloc[-1] > 1.1 * df['volume_sma'].iloc[-1]: # RELAXED vol
         dir_str = "Bullish" if c['close'] > c['open'] else "Bearish"
         patterns.add(f"{dir_str} Displacement Candle ({tf})")
     if body > 0 and lower > 2 * body and upper < body * 0.3 and c['close'] > p['close']:
@@ -1017,7 +1023,6 @@ def detect_candle_patterns(df: pd.DataFrame, tf: str) -> List[str]:
     if c['high'] < p['high'] and c['low'] > p['low']:
         patterns.add(f"Inside Bar ({tf})")
     return list(patterns)
-
 async def process_trade(trades: Dict[str, Any], to_delete: List[str], now: datetime, current_capital: float, prices: Dict[str, Optional[float]], updated_keys: List[str], is_protected: bool = False):
     for trade_key, trade in list(trades.items()):
         clean_symbol = get_clean_symbol(trade_key)
@@ -1120,14 +1125,13 @@ async def process_trade(trades: Dict[str, Any], to_delete: List[str], now: datet
                 save_stats(stats)
                 to_delete.append(trade_key)
                 updated_keys.append(trade_key)
-
 async def btc_trend_update(context):
     global btc_trend_global
     try:
         df = await fetch_ohlcv('BTC/USDT', '1d', limit=500)
         if len(df) == 0:
             logging.warning("Empty raw DF in BTC trend – possible rate limit or insufficient data")
-            btc_trend_global = "Sideways"  # fallback
+            btc_trend_global = "Sideways" # fallback
             return
         # Compute only necessary for trend
         df = df.copy()
@@ -1155,8 +1159,7 @@ async def btc_trend_update(context):
         logging.info(f"Global BTC trend: {btc_trend_global}")
     except Exception as e:
         logging.error(f"BTC trend update error: {e}")
-        btc_trend_global = "Sideways"  # safe fallback
-
+        btc_trend_global = "Sideways" # safe fallback
 async def price_update_callback(context):
     global last_price_update, prices_global
     now = time.time()
@@ -1175,7 +1178,6 @@ async def price_update_callback(context):
     finally:
         exec_time = time.perf_counter() - start
         logging.info(f"Price update cycle completed in {exec_time:.2f}s")
-
 async def track_callback(context):
     global stats, open_trades, protected_trades
     start_time = time.perf_counter()
@@ -1220,7 +1222,6 @@ async def track_callback(context):
     except Exception as e:
         logging.error(f"Track callback error: {e}")
         logging.info(f"Track cycle failed in {time.perf_counter() - start_time:.2f}s")
-
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logging.info(f"/stats triggered by user {update.effective_user.id}")
     try:
@@ -1247,7 +1248,6 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"/stats error: {e}")
         await update.message.reply_text(f"Error fetching stats: {str(e)}", parse_mode='Markdown')
-
 async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logging.info(f"/health triggered by user {update.effective_user.id}")
     try:
@@ -1257,7 +1257,7 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         active = len([t for trades in [open_trades, protected_trades] for t in trades.values() if t.get('active')])
         pending = len([t for t in open_trades.values() if not t.get('active')])
         msg = (
-            "**Grok Elite Bot v24.02.0 - Daily Hunter Alive!**\n\n"
+            "**Grok Elite Bot v24.02.1 - Daily Hunter Alive!**\n\n"
             f"**Uptime Check:** {uptime}\n"
             f"**Open Trades:** {open_count}\n"
             f"**Protected Trades:** {protected_count}\n"
@@ -1269,12 +1269,10 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"/health error: {e}")
         await update.message.reply_text(f"Health check failed: {str(e)}", parse_mode='Markdown')
-
 async def recap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logging.info(f"/recap triggered by user {update.effective_user.id}")
     await daily_callback(context)
     await update.message.reply_text("**Manual recap triggered**—check logs/messages!", parse_mode='Markdown')
-
 async def daily_callback(context):
     now = datetime.now(timezone.utc)
     recap_file = RECAP_FILE
@@ -1362,11 +1360,9 @@ async def daily_callback(context):
     except Exception as e:
         logging.error(f"Daily recap error: {type(e).name}: {str(e)}")
         await asyncio.sleep(1)
-
 async def webhook_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
         logging.info(f"Webhook update: user {update.effective_user.id}, command {update.message.text}")
-
 # Update signal_callback: consol check, remove mini-backtest, min triggers=1, +liq
 async def signal_callback(context):
     start_time = time.perf_counter()
@@ -1388,6 +1384,7 @@ async def signal_callback(context):
         oi_tasks = [fetch_open_interest(s) for s in SYMBOLS]
         oi_results = await asyncio.gather(*oi_tasks, return_exceptions=True)
         oi_data_dict = {SYMBOLS[i]: oi_results[i] if not isinstance(oi_results[i], Exception) else None for i in range(len(SYMBOLS))}
+        signals_sent = 0
         for symbol in SYMBOLS:
             sym_start = time.perf_counter()
             price = prices.get(symbol)
@@ -1415,7 +1412,7 @@ async def signal_callback(context):
                 logging.info(f"Finished {symbol} in {sym_time:.2f}s")
                 continue
             oi_data = oi_data_dict.get(symbol)
-            whale_data = {'boost': 0, 'reason': ''}  # Retained, but simplified - no fetch
+            whale_data = {'boost': 0, 'reason': ''} # Retained, but simplified - no fetch
             data = {}
             for tf in TIMEFRAMES:
                 df_tf = await fetch_ohlcv(symbol, tf)
@@ -1446,7 +1443,7 @@ async def signal_callback(context):
                         else:
                             trend = "Sideways"
                 else:
-                    trend = "Sideways"  # Fallback neutral
+                    trend = "Sideways" # Fallback neutral
             triggers = set()
             is_alt = symbol != 'BTC/USDT'
             for tf in TIMEFRAMES:
@@ -1461,14 +1458,14 @@ async def signal_callback(context):
                 triggers.update(normalized_fvgs)
                 candles = detect_candle_patterns(df, tf)
                 triggers.update(candles)
-                if len(df) > 20 and 'volume_sma' in df.columns and not pd.isna(df['volume_sma'].iloc[-1]) and df['volume'].iloc[-1] > 1.1 * df['volume_sma'].iloc[-1]:  # RELAXED
+                if len(df) > 20 and 'volume_sma' in df.columns and not pd.isna(df['volume_sma'].iloc[-1]) and df['volume'].iloc[-1] > 1.1 * df['volume_sma'].iloc[-1]: # RELAXED
                     triggers.add(f"Inst Vol Surge ({tf})")
                 obs = await find_unmitigated_order_blocks(df, tf=tf, symbol=symbol)
                 raw_obs = len(obs.get('bullish', []) + obs.get('bearish', []))
                 logging.info(f"Raw OBs for {symbol} {tf}: {raw_obs} (before elite filter)")
                 for ob_type in ['bullish', 'bearish']:
                     for ob in obs.get(ob_type, []):
-                        if ob['strength'] < 2:  # RELAXED: >=2
+                        if ob['strength'] < 2: # RELAXED: >=2
                             continue
                         mid = (ob['low'] + ob['high']) / 2
                         dist_pct = abs(price - mid) / price * 100
@@ -1484,7 +1481,7 @@ async def signal_callback(context):
                 if df['liq_sweep'].iloc[-1]:
                     triggers.add(f"Liq Sweep Bounce ({tf})")
             logging.info(f"All triggers for {symbol}: {list(triggers)}")
-            strong_triggers = [t for t in triggers if any(kw in t for kw in ['OB str', 'Displacement', 'Inst Vol', 'Exhaust', 'Bearish Short', 'Liq Sweep', 'Order Flow'])]  # NEW: + Liq Sweep
+            strong_triggers = [t for t in triggers if any(kw in t for kw in ['OB str', 'Displacement', 'Inst Vol', 'Exhaust', 'Bearish Short', 'Liq Sweep', 'Order Flow'])] # NEW: + Liq Sweep
             logging.info(f"Elite triggers for {symbol}: {len(strong_triggers)} (min 1 req)")
             if len(strong_triggers) < 1:
                 sym_time = time.perf_counter() - sym_start
@@ -1492,7 +1489,7 @@ async def signal_callback(context):
                 logging.info(f"Finished {symbol} in {sym_time:.2f}s")
                 continue
             premium_zones = []
-            for tf in ['1d', '1w']:  # Focus daily
+            for tf in ['1d', '1w']: # Focus daily
                 if tf not in data:
                     continue
                 tf_df = data[tf]
@@ -1522,7 +1519,7 @@ async def signal_callback(context):
             if live_trade_key and not grok_potential.get('no_live_trade', True):
                 grok = grok_potential[live_trade_key]
                 logging.info(f"Grok elite live trade for {symbol}: {grok}")
-                if grok.get('strength', 0) < 2 or grok.get('confidence', 0) < 70:  # RELAXED
+                if grok.get('strength', 0) < 2 or grok.get('confidence', 0) < 70: # RELAXED
                     logging.info(f"Skipped non-elite live {symbol}: str {grok.get('strength', 0)} or conf {grok.get('confidence', 0)}")
                     sym_time = time.perf_counter() - sym_start
                     logging.info(f"Finished {symbol} in {sym_time:.2f}s")
@@ -1590,7 +1587,7 @@ async def signal_callback(context):
                                 'active': False,
                                 'last_check': datetime.now(timezone.utc),
                                 'processed': False,
-                                'strength': grok.get('strength', 2)  # RELAXED
+                                'strength': grok.get('strength', 2) # RELAXED
                             }
                             save_trades(open_trades)
                             last_signal_time[symbol] = now
@@ -1636,15 +1633,16 @@ async def signal_callback(context):
                 )
                 logging.info(f"Sending elite live for {symbol}")
                 await bot.send_message(CHAT_ID, msg, parse_mode='Markdown')
+                signals_sent += 1
             else:
                 sent_roadmap = False
                 if 'roadmap' in grok_potential and grok_potential['roadmap']:
                     conservative_msg = f"**{symbol.replace('/USDT','')} ELITE ROADMAP** | *Price:* {format_price(price)} | *Trend:* {trend}"
                     if is_alt and btc_trend: conservative_msg += f" | *BTC:* {btc_trend}"
-                    conservative_msg += "\n\nElite inst zones (70%+ conf, str>=2):\n"  # RELAXED
+                    conservative_msg += "\n\nElite inst zones (70%+ conf, str>=2):\n" # RELAXED
                     roadmap_count = 0
                     for i, z in enumerate(grok_potential['roadmap'], 1):
-                        if z['confidence'] > 70 and z['dist_pct'] < 7 and z.get('strength', 0) >= 2:  # RELAXED v24.02.0
+                        if z['confidence'] > 70 and z['dist_pct'] < 7 and z.get('strength', 0) >= 2: # RELAXED v24.02.0
                             roadmap_count += 1
                             entry_low = min(z['entry_low'], z['entry_high'])
                             entry_high = max(z['entry_low'], z['entry_high'])
@@ -1741,6 +1739,7 @@ async def signal_callback(context):
                         await bot.send_message(CHAT_ID, conservative_msg, parse_mode='Markdown')
                         last_signal_time[symbol] = now
                         sent_roadmap = True
+                        signals_sent += 1
                 if not sent_roadmap and len(strong_triggers) >= 1:
                     trigger_msg = f"**{symbol.replace('/USDT','')} - Elite Triggers** | *Price:* {format_price(price)} | *Trend:* {trend}"
                     if is_alt and btc_trend: trigger_msg += f" | *BTC:* {btc_trend}"
@@ -1749,16 +1748,39 @@ async def signal_callback(context):
                     await bot.send_message(CHAT_ID, trigger_msg, parse_mode='Markdown')
                     last_signal_time[symbol] = now
                     sent_roadmap = True
+                    signals_sent += 1
             sym_time = time.perf_counter() - sym_start
             logging.info(f"Finished {symbol} in {sym_time:.2f}s")
             await asyncio.sleep(2)
+        # NEW v24.02.1: Levels to Watch if no signals sent this cycle
+        if signals_sent == 0:
+            watch_msg = "**Levels to Watch (Daily Analysis)**\n\n"
+            for symbol in SYMBOLS:
+                if symbol in last_watch_time and now - last_watch_time[symbol] < timedelta(hours=WATCH_COOLDOWN_HOURS):
+                    continue
+                price = prices.get(symbol)
+                if price is None:
+                    continue
+                data = {}
+                for tf in ['1d']: # Focus 1d
+                    df_tf = await fetch_ohlcv(symbol, tf)
+                    book = order_books.get(symbol)
+                    data[tf] = add_indicators(df_tf, book) if len(df_tf) > 0 else pd.DataFrame()
+                trend = "Sideways" # Fallback
+                oi_data = oi_data_dict.get(symbol)
+                analysis = await query_grok_watch_levels(symbol, price, trend, btc_trend, data, oi_data)
+                watch_msg += f"{symbol.replace('/USDT','')}: {analysis}\n\n"
+                last_watch_time[symbol] = now
+                logging.info(f"Watch levels sent for {symbol}")
+            if len(watch_msg) > 50:
+                await bot.send_message(CHAT_ID, watch_msg, parse_mode='Markdown')
+                logging.info("Levels to Watch message sent")
         total_time = time.perf_counter() - start_time
         logging.info(f"=== Daily signal cycle complete in {total_time:.2f}s ===")
     except Exception as e:
         logging.error(f"Signal callback error: {e}")
         total_time = time.perf_counter() - start_time
         logging.info(f"=== Signal cycle complete in {total_time:.2f}s (error) ===")
-
 async def post_init(application: Application) -> None:
     logging.info("Starting post_init: Sending welcome and setting webhook...")
     try:
@@ -1787,7 +1809,6 @@ async def post_init(application: Application) -> None:
     asyncio.create_task(price_background_task())
     logging.info("Background Polling Task started – fresh prices + order flow every 10s!")
     logging.info("Post_init complete – Daily signals via job in ~60s.")
-
 def main():
     # Env debug logs
     logging.info(f"Loaded env: TOKEN={TELEGRAM_TOKEN[:5] if TELEGRAM_TOKEN else 'MISSING'}..., CHAT={CHAT_ID if CHAT_ID else 'MISSING'}, KEY={XAI_API_KEY[:5] if XAI_API_KEY else 'MISSING'}...")
@@ -1853,6 +1874,5 @@ def main():
         asyncio.run(exchange.close())
         asyncio.run(futures_exchange.close())
         logging.info("CCXT exchanges closed gracefully!")
-
 if __name__ == "__main__":
     main()
