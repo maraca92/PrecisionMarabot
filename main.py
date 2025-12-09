@@ -1,6 +1,5 @@
-# main.py - Grok Elite Signal Bot v25.02.0 - ICT Elite: Regime-Aware MTF Confluence + Dynamic EV + Streamlined Stack + Self-Calibrating Fixes
-# UPGRADE (v25.02.0): Strict premium/discount rejection, self-calibrating EV from backtest, FVG strength boost, precise Grok prompts, CSV trade logging,
-# regime in trades, multi-symbol backtest, Monte Carlo validation, live dashboard, paper trading mode. Projected win rate: 68-75%.
+# main.py - Grok Elite Signal Bot v25.02.1 - ICT Elite: Regime-Aware MTF Confluence + Dynamic EV + Streamlined Stack + Self-Calibrating Fixes
+# UPGRADE (v25.02.1): Fixed f-string POC in watch_levels, BTC trend resilience (<200 bars check), alt liquidity ($300k for SOL/ETH).
 # Retained: Daily 1d prio, OB str>=2, liq sweeps bounces, ADX anti-consol, vol>1.1x, conf>=70% dynamic, dist<7%, ~2x signals, Levels to Watch.
 # NEW CONSTANTS: Added for ICT params (e.g., FVG_DISPLACEMENT_MULT=2, ZONE_LOOKBACK=100), PAPER_TRADING=true
 import asyncio
@@ -405,17 +404,17 @@ def add_institutional_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """Focus on orderflow + structure, not derivatives"""
     if len(df) == 0:
         return df
-  
+ 
     # CRITICAL FIX: Ensure we have a proper index before any operations
     # If DatetimeIndex was lost, operations will fail
     if not isinstance(df.index, (pd.DatetimeIndex, pd.RangeIndex)):
         logging.warning(f"Unexpected index type in add_institutional_indicators: {type(df.index)}")
         # Reset to RangeIndex for safety
         df = df.reset_index(drop=True)
-  
+ 
     # Make a copy to avoid modifying original
     df = df.copy()
-  
+ 
     # 1. PRICE STRUCTURE (non-derivative)
     df['swing_high'] = df['high'].rolling(21, center=True).max() == df['high']
     df['swing_low'] = df['low'].rolling(21, center=True).min() == df['low']
@@ -441,12 +440,12 @@ def add_institutional_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # Order Flow (now separate, but integrate liq_sweep)
     if 'liq_sweep' not in df.columns:
         df['liq_sweep'] = False # Placeholder if no book
-    
+   
     # CRITICAL: Ensure 'date' column is preserved for downstream functions
     if 'date' not in df.columns and 'ts' in df.columns:
         df['date'] = pd.to_datetime(df['ts'], unit='ms')
         logging.debug("Restored 'date' column in add_institutional_indicators")
-   
+  
     return df
 # NEW: FVG strength grading (volume + displacement)
 def calculate_fvg_strength(df: pd.DataFrame) -> pd.DataFrame:
@@ -500,14 +499,14 @@ def calculate_premium_discount(df: pd.DataFrame, lookback: int = ZONE_LOOKBACK) 
         df['premium_pct'] = 0.5
         df['zone'] = 'equilibrium'
         return df
-   
+  
     # CRITICAL: Work on copy to preserve original columns
     df = df.copy()
-  
+ 
     df['range_high'] = df['high'].rolling(lookback, min_periods=1).max()
     df['range_low'] = df['low'].rolling(lookback, min_periods=1).min()
     df['range_mid'] = (df['range_high'] + df['range_low']) / 2
-  
+ 
     # Avoid division by zero
     range_size = df['range_high'] - df['range_low']
     df['premium_pct'] = np.where(
@@ -515,10 +514,10 @@ def calculate_premium_discount(df: pd.DataFrame, lookback: int = ZONE_LOOKBACK) 
         (df['close'] - df['range_low']) / range_size,
         0.5 # Default to equilibrium if no range
     )
-  
+ 
     # Ensure premium_pct is 0-1
     df['premium_pct'] = df['premium_pct'].clip(0, 1)
-  
+ 
     # Use pd.cut with proper handling
     try:
         df['zone'] = pd.cut(
@@ -533,7 +532,7 @@ def calculate_premium_discount(df: pd.DataFrame, lookback: int = ZONE_LOOKBACK) 
         df['zone'] = 'equilibrium'
         df.loc[df['premium_pct'] < 0.3, 'zone'] = 'discount'
         df.loc[df['premium_pct'] > 0.7, 'zone'] = 'premium'
-  
+ 
     return df
 # UPDATED: track_ob_mitigation (partial mitigation with vol + penetration)
 def track_ob_mitigation(ob: Dict, df_since_formation: pd.DataFrame) -> float:
@@ -690,44 +689,44 @@ def is_in_no_trade_zone(price: float, symbol: str, df: pd.DataFrame) -> bool:
         return True
     if price % 1000 < 50 or price % 1000 > 950:
         return True
-   
+  
     # Previous week's close check (needs DatetimeIndex)
     # Skip this check if we don't have proper data to avoid crashes
     if len(df) < 7 or 'date' not in df.columns:
         return False
-   
+  
     try:
         # Set DatetimeIndex for resampling
         df_temp = df.set_index('date').sort_index()
-       
+      
         # Resample to weekly
         df_1w = df_temp.resample('1W', label='right', closed='right').agg({
             'high': 'max',
             'low': 'min',
             'close': 'last'
         })
-       
+      
         # Need at least 2 weeks
         if len(df_1w) < 2:
             return False
-       
+      
         # Get previous week's close
         prev_week_close = df_1w['close'].iloc[-2]
-       
+      
         # Check validity
         if pd.isna(prev_week_close) or prev_week_close <= 0:
             return False
-       
+      
         # Check if current price is near previous week's close
         if abs(price - prev_week_close) / price < 0.003: # Within 0.3%
             logging.info(f"No-trade zone: {symbol} @ {price:.2f} near prev week {prev_week_close:.2f}")
             return True
-   
+  
     except Exception as e:
         # Don't block trades if check fails
         logging.warning(f"is_in_no_trade_zone check failed for {symbol}: {e}")
         return False
-   
+  
     return False
 # NEW: Liquidity check (spread + depth)
 async def check_sufficient_liquidity(symbol: str) -> bool:
@@ -741,7 +740,11 @@ async def check_sufficient_liquidity(symbol: str) -> bool:
             return False
         total_bid_vol = sum(amt for _, amt in book['bids'][:10])
         total_ask_vol = sum(amt for _, amt in book['asks'][:10])
-        min_depth_usd = 10 * 60000 # $600k
+        # Adjust minimum depth based on symbol
+        if 'SOL' in symbol or 'ETH' in symbol:
+            min_depth_usd = 5 * 60000 # $300k for alts (lower than BTC)
+        else:
+            min_depth_usd = 10 * 60000 # $600k for BTC
         if (total_bid_vol * best_bid < min_depth_usd or total_ask_vol * best_ask < min_depth_usd):
             return False
         return True
@@ -784,7 +787,7 @@ async def find_next_premium_zones(df: pd.DataFrame, current_price: float, tf: st
     # Before calling is_in_no_trade_zone, ensure 'date' column exists
     if 'date' not in df.columns and 'ts' in df.columns:
         df['date'] = pd.to_datetime(df['ts'], unit='ms')
-   
+  
     if is_in_no_trade_zone(current_price, symbol, df): # NEW: Quick win
         logging.info(f"Skipped {symbol} {tf}: No-trade zone")
         return []
@@ -1247,10 +1250,10 @@ async def fetch_ohlcv(symbol: str, tf: str, limit: int = 200, since: Optional[in
                 # Create DataFrame
                 df = pd.DataFrame(data, columns=['ts', 'open', 'high', 'low', 'close', 'volume'])
                 df['date'] = pd.to_datetime(df['ts'], unit='ms')
-              
+             
                 # Compute VWAP BEFORE any other operations
                 df = compute_vwap_safe(df) # THIS LINE MUST BE HERE
-              
+             
                 # Store in cache
                 ohlcv_cache[cache_key] = {'df': df, 'timestamp': now}
                 success = True
@@ -1275,18 +1278,18 @@ def compute_vwap_safe(df: pd.DataFrame) -> pd.DataFrame:
     if len(df) < 20 or 'date' not in df.columns:
         df['vwap'] = np.nan
         return df
-  
+ 
     try:
         # Create indexed copy for VWAP
         df_indexed = df.set_index('date').sort_index().copy()
-      
+     
         # Check volume
         total_vol = df_indexed['volume'].sum()
         if total_vol == 0:
             df['vwap'] = np.nan
             logging.debug("VWAP skipped: zero volume")
             return df
-      
+     
         # Compute VWAP
         vwap_series = ta.vwap(
             df_indexed['high'],
@@ -1294,17 +1297,17 @@ def compute_vwap_safe(df: pd.DataFrame) -> pd.DataFrame:
             df_indexed['close'],
             df_indexed['volume']
         )
-      
+     
         # Map back to original DataFrame by date
         vwap_dict = vwap_series.to_dict()
         df['vwap'] = df['date'].map(vwap_dict)
-      
+     
         nan_count = df['vwap'].isna().sum()
         if nan_count > len(df) * 0.5:
             logging.warning(f"VWAP has {nan_count}/{len(df)} NaN values")
-      
+     
         return df
-      
+     
     except Exception as e:
         logging.error(f"VWAP computation failed: {e}")
         df['vwap'] = np.nan
@@ -1370,17 +1373,31 @@ async def btc_trend_update(context):
             logging.warning("Empty raw DF in BTC trend – possible rate limit or insufficient data")
             btc_trend_global = "Sideways"
             return
+       
+        # Don't work on copy yet (preserve data)
+        if len(df) < 200:
+            logging.warning(f"Insufficient bars for BTC trend ({len(df)} < 200) – fallback to Sideways")
+            btc_trend_global = "Sideways"
+            return
+       
+        # Compute EMA200 (needs 200 bars for accuracy)
         df = df.copy()
-        df['ema200'] = ta.ema(df['close'], 200) # UPDATED: EMA200
+        df['ema200'] = ta.ema(df['close'], 200)
+       
+        # Drop NaN but keep last valid row
         df = df.dropna(subset=['ema200'])
+       
         if len(df) == 0:
             logging.warning("Empty DF after EMA in BTC trend – insufficient data")
             btc_trend_global = "Sideways"
             return
+       
+        # Additional check: ensure we have recent data
         if len(df) < 100:
-            logging.warning(f"Insufficient bars ({len(df)}) for trend in BTC – fallback to Sideways")
+            logging.warning(f"Insufficient valid bars after EMA ({len(df)} < 100) – fallback to Sideways")
             btc_trend_global = "Sideways"
             return
+       
         l = df.iloc[-1]
         if pd.isna(l['ema200']):
             logging.warning("EMA NaN in BTC trend – skipping update")
@@ -1533,29 +1550,29 @@ async def backtest_all_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for symbol in SYMBOLS:
         try:
             await update.message.reply_text(f"Running backtest for {symbol}...", parse_mode='Markdown')
-        
+       
             days = 90
             since = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000)
             df = await fetch_ohlcv(symbol, '1d', limit=days, since=since)
-        
+       
             if len(df) == 0:
                 summary_msg += f"{symbol}: No data\n"
                 continue
-        
+       
             # Use same logic as backtest_cmd (extract to function for DRY)
             trades = await run_backtest_logic(df, symbol)
-        
+       
             wins = len([t for t in trades if t['result'] == 'win'])
             total = len([t for t in trades if t['result'] != 'open'])
             winrate = (wins / total * 100) if total > 0 else 0
             total_pnl = sum(t['pnl'] for t in trades)
-        
+       
             results[symbol] = {'winrate': winrate, 'total_trades': total, 'pnl': total_pnl}
-        
+       
             summary_msg += f"**{symbol.replace('/USDT','')}**: {wins}/{total} ({winrate:.1f}%) | PnL: {total_pnl:+.2f}\n"
-        
+       
             await asyncio.sleep(2)
-    
+   
         except Exception as e:
             logging.error(f"Backtest error for {symbol}: {e}")
             summary_msg += f"{symbol}: Error\n"
@@ -1604,10 +1621,10 @@ async def validate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         since = int((datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000)
         df = await fetch_ohlcv('BTC/USDT', '1d', limit=days, since=since)
         trades = await run_backtest_logic(df, 'BTC/USDT')
-    
+   
         # Run Monte Carlo
         result = monte_carlo_validation(trades, n_simulations=1000)
-    
+   
         msg = (
             f"**Monte Carlo Validation (1000 sims)**\n\n"
             f"**Actual PnL**: {result['actual_pnl']:+.2f}\n"
@@ -1616,7 +1633,7 @@ async def validate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"**Confidence**: {result['confidence']}\n\n"
             f"**Interpretation**: {'Edge is statistically significant ✅' if result['is_significant'] else 'Edge may be luck ⚠️'}"
         )
-    
+   
         await send_throttled(CHAT_ID, msg, parse_mode='Markdown')
         logging.info(f"Monte Carlo validation: p={result['p_value']:.4f}")
     except Exception as e:
@@ -1634,58 +1651,58 @@ async def dashboard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not Path(TRADE_LOG_FILE).exists():
             await update.message.reply_text("No trade history yet. Take some trades first!", parse_mode='Markdown')
             return
-    
+   
         trades_df = pd.read_csv(TRADE_LOG_FILE)
-    
+   
         if len(trades_df) == 0:
             await update.message.reply_text("No closed trades yet.", parse_mode='Markdown')
             return
-    
+   
         # Calculate metrics
         wins = len(trades_df[trades_df['result'] == 'WIN'])
         losses = len(trades_df[trades_df['result'] == 'LOSS'])
         total = wins + losses
         winrate = (wins / total * 100) if total > 0 else 0
-    
+   
         avg_win = trades_df[trades_df['result'] == 'WIN']['pnl_pct'].mean() if wins > 0 else 0
         avg_loss = trades_df[trades_df['result'] == 'LOSS']['pnl_pct'].mean() if losses > 0 else 0
-    
+   
         expectancy = (winrate/100 * avg_win) + ((100-winrate)/100 * avg_loss)
-    
+   
         # Best/worst trades
         best_trade = trades_df.loc[trades_df['pnl_pct'].idxmax()]
         worst_trade = trades_df.loc[trades_df['pnl_pct'].idxmin()]
-    
+   
         # By symbol
         symbol_stats = trades_df.groupby('symbol').agg({
             'result': lambda x: (x == 'WIN').sum() / len(x) * 100,
             'pnl_pct': 'sum'
         }).round(1)
-    
+   
         # By regime
         regime_stats = trades_df.groupby('regime').agg({
             'result': lambda x: (x == 'WIN').sum() / len(x) * 100,
             'pnl_pct': 'sum'
         }).round(1) if 'regime' in trades_df.columns else None
-    
+   
         # Build message
         msg = f"**📊 Performance Dashboard**\n\n"
         msg += f"**Overall**: {wins}W / {losses}L ({winrate:.1f}%)\n"
         msg += f"**Avg Win**: +{avg_win:.2f}% | **Avg Loss**: {avg_loss:.2f}%\n"
         msg += f"**Expectancy**: {expectancy:+.2f}%\n\n"
-    
+   
         msg += f"**Best Trade**: {best_trade['symbol']} {best_trade['direction']} @ {best_trade['entry_price']:.2f} → {best_trade['pnl_pct']:+.2f}%\n"
         msg += f"**Worst Trade**: {worst_trade['symbol']} {worst_trade['direction']} @ {worst_trade['entry_price']:.2f} → {worst_trade['pnl_pct']:+.2f}%\n\n"
-    
+   
         msg += "**By Symbol**:\n"
         for symbol, row in symbol_stats.iterrows():
             msg += f" {symbol}: {row['result']:.0f}% WR | {row['pnl_pct']:+.1f}%\n"
-    
+   
         if regime_stats is not None:
             msg += "\n**By Regime**:\n"
             for regime, row in regime_stats.iterrows():
                 msg += f" {regime}: {row['result']:.0f}% WR | {row['pnl_pct']:+.1f}%\n"
-    
+   
         await send_throttled(CHAT_ID, msg, parse_mode='Markdown')
         logging.info(f"Dashboard sent: {total} trades analyzed")
     except Exception as e:
@@ -1733,7 +1750,7 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         active = len([t for trades in [open_trades, protected_trades] for t in trades.values() if t.get('active')])
         pending = len([t for t in open_trades.values() if not t.get('active')])
         msg = (
-            f"**Grok Elite Bot v25.02.0 - ICT Elite Alive!**\n\n"
+            f"**Grok Elite Bot v25.02.1 - ICT Elite Alive!**\n\n"
             f"**MODE**: {'📝 PAPER TRADING' if PAPER_TRADING else '💰 LIVE TRADING'}\n"
             f"**Uptime Check:** {uptime}\n"
             f"**Open Trades:** {open_count}\n"
@@ -2037,18 +2054,33 @@ async def query_grok_watch_levels(symbol: str, price: float, trend: str, btc_tre
     df_1d = data.get('1d', pd.DataFrame())
     obs = await find_unmitigated_order_blocks(df_1d, tf='1d', symbol=symbol)
     poc = max(calc_liquidity_profile(df_1d).items(), key=lambda x: x[1])[0] if len(df_1d) > 0 else None
+   
     level_summary = ""
     for ob_type in ['bullish', 'bearish']:
         for ob in obs.get(ob_type, [])[:2]:
             mid = (ob['low'] + ob['high']) / 2
-            level_summary += f"{ob_type.capitalize()} OB: {mid:.4f} (str{ob['strength']}, mit{ob['mitigation']:.1f}); "
+            level_summary += f"{ob_type.capitalize()} OB: {mid:.4f} (str{ob['strength']}, mit{ob.get('mitigation', 0):.1f}); "
+   
     oi_str = f"OI change: {oi_data['oi_change_pct']:.1f}%" if oi_data else "No OI data"
-    context = f"{symbol} | Price: {price:.4f} | Trend: {trend} {'| BTC: ' + btc_trend if is_alt else ''}\nLevels: {level_summary} | POC: {poc:.4f if poc else 'N/A'} | {oi_str}\nAnalyze key 1d levels to watch (OB/liq/POC), why (confluence), potential trade plan (bias/entry/SL/TP outline, max 50 chars per level)."
+   
+    # Format POC properly
+    poc_str = f"{poc:.4f}" if poc is not None else 'N/A'
+   
+    # Build context (cleaner multi-line)
+    context = (
+        f"{symbol} | Price: {price:.4f} | Trend: {trend}"
+        f"{' | BTC: ' + btc_trend if is_alt else ''}\n"
+        f"Levels: {level_summary} | POC: {poc_str} | {oi_str}\n"
+        f"Analyze key 1d levels to watch (OB/liq/POC), why (confluence), "
+        f"potential trade plan (bias/entry/SL/TP outline, max 50 chars per level)."
+    )
+   
     system_prompt = (
         "You are ICT daily analyst. Output ONLY concise text: 'Watch [level1] ([why1]) – Plan: [plan1]; [level2] ([why2]) – Plan: [plan2]'. "
         "Focus 1d OB str>=2 low-mit, liq sweeps, POC. 2-3 levels max. Bias from trend. No spam, precise prices."
-        f"Alts: BTC align."
+        f"{'Alts: BTC align.' if is_alt else ''}"
     )
+   
     models = [_working_model, "grok-4", "grok-3"] if _working_model else ["grok-4", "grok-3"]
     for model in models:
         payload = {
@@ -2090,24 +2122,24 @@ async def backtest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Track TP1/TP2 separately
         tp1_hits = 0
         tp2_hits = 0
-    
+   
         for trade in trades:
             if trade['result'] == 'win':
                 tp2_hits += 1
                 tp1_hits += 1 # Assume TP1 also hit if TP2 hit
             elif trade.get('hit_tp1'): # If you track partial TP1
                 tp1_hits += 1
-    
+   
         wins = len([t for t in trades if t['result'] == 'win'])
         total = len([t for t in trades if t['result'] != 'open'])
         winrate = (wins / total * 100) if total > 0 else 0
         total_pnl = sum(t['pnl'] for t in trades)
         sharpe = np.mean([t['pnl'] for t in trades]) / (np.std([t['pnl'] for t in trades]) or np.inf) if trades else 0
-    
+   
         # Calculate hit rates
         tp1_hit_rate = tp1_hits / total if total > 0 else 0.60
         tp2_hit_rate = tp2_hits / total if total > 0 else 0.35
-    
+   
         bt_results = {
             'winrate': winrate,
             'total_pnl': total_pnl,
@@ -2128,15 +2160,15 @@ async def send_welcome_once():
     if not os.path.exists(FLAG_FILE):
         try:
             welcome_text = (
-                f"**Grok Elite Bot v25.02.0 ONLINE ♔**\n\n"
+                f"**Grok Elite Bot v25.02.1 ONLINE ♔**\n\n"
                 f"**MODE**: {'📝 PAPER TRADING' if PAPER_TRADING else '💰 LIVE TRADING'}\n\n"
-                "• v25.02.0: Strict zone rejection, self-cal EV, FVG strength, precise Grok, CSV logs, regime tracking, multi-backtest, Monte Carlo, dashboard, paper mode. Win proj 68-75%.\n"
+                "• v25.02.1: Fixed f-string POC, BTC resilience, alt liquidity. Win proj 68-75%.\n"
                 "• Retained: Daily 1d, str>=2, sweeps bounces, ADX anti-consol, vol>1.1x, 70% dyn, <7%, Levels to Watch."
             )
             escaped_text = html.escape(welcome_text)
             await send_throttled(CHAT_ID, escaped_text, parse_mode='HTML')
             open(FLAG_FILE, "w").close()
-            logging.info("Welcome sent (v25.02.0)")
+            logging.info("Welcome sent (v25.02.1)")
         except Exception as e:
             logging.error(f"Failed to send welcome: {e}")
 # UPDATED: signal_callback: Integrate regime/MTF/quick wins, new indicators, regime/reason in trades
