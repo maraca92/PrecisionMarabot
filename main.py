@@ -1,5 +1,6 @@
-# main.py - Grok Elite Signal Bot v24.01.7 - Institutional OB Focus: Zero Noise Edition (Order Flow Enhanced + Env Debug + Relaxed Roadmap)
-# UPGRADE (v24.01.7): Relaxed roadmap generation thresholds (conf>80 from 90, dist<6% from 5%, filter prob>=80 from 85, triggers>=2 from 3) for earlier signals with minimal accuracy trade-off.
+# main.py - Grok Elite Signal Bot v24.01.8 - Institutional OB Focus: Zero Noise Edition (Order Flow Enhanced + Env Debug + Relaxed Roadmap + Low-Vol Unlock)
+# UPGRADE (v24.01.8): Vol>1.2x (from 1.5x), delta>0.5% (from 1%), min 1 trigger (from 2) for low-vol roadmaps; all triggers log.
+# Retained v24.01.7: Relaxed roadmap generation thresholds (conf>80 from 90, dist<6% from 5%, filter prob>=80 from 85, triggers>=2 from 3) for earlier signals with minimal accuracy trade-off.
 # Retained v24.01.6: Env debug logs in main(); query_grok_instant upgraded (str=2+, conf≥75%, lev3-7x); backtest symmetry fixed; order_flow cache eviction.
 # Retained v24.01.5: Order Flow (delta + footprint) via ccxt order_book; conf boost +2 on imbalance >1%; triggers + delta.
 # Retained v24.01.4: Bidirectional + EMA200 bias + FVG caution – no bias.
@@ -349,7 +350,8 @@ async def send_welcome_once():
     if not os.path.exists(FLAG_FILE):
         try:
             welcome_text = (
-                "**Grok Elite Bot v24.01.7 ONLINE ♔** – Institutional OB Hunter: Zero Noise (Order Flow Enhanced + Env Debug + Relaxed Roadmap)\n\n"
+                "**Grok Elite Bot v24.01.8 ONLINE ♔** – Institutional OB Hunter: Zero Noise (Order Flow Enhanced + Env Debug + Relaxed Roadmap + Low-Vol Unlock)\n\n"
+                "• v24.01.8: Vol>1.2x (from 1.5x), delta>0.5% (from 1%), min 1 trigger (from 2) for low-vol roadmaps; all triggers log.\n"
                 "• v24.01.7: Relaxed roadmap (conf>80, dist<6%, prob>=80, triggers>=2) for earlier signals, minimal accuracy loss.\n"
                 "• v24.01.6: Env debug logs; query_grok_instant upgrade (str=2+, conf≥75%, lev3-7x); backtest symmetry; order_flow cache eviction.\n"
                 "• v24.01.5: Order Flow (delta + footprint via ccxt book); conf +2 on imbalance >1%; triggers + delta for absorpcja confirm.\n"
@@ -364,7 +366,7 @@ async def send_welcome_once():
             escaped_text = html.escape(welcome_text)
             await bot.send_message(CHAT_ID, escaped_text, parse_mode='HTML')
             open(FLAG_FILE, "w").close()
-            logging.info("Welcome sent (v24.01.7)")
+            logging.info("Welcome sent (v24.01.8)")
         except Exception as e:
             logging.error(f"Failed to send welcome: {e}")
 async def query_grok_instant(context: str, is_alt: bool = False) -> Dict[str, Any]:
@@ -429,7 +431,7 @@ def check_rr(trade: Dict[str, Any]) -> bool:
     return rr2 >= 2.0
 async def query_grok_potential(zones: List[Dict], symbol: str, current_price: float, trend: str, btc_trend: Optional[str], atr: float = 0) -> Dict[str, Any]:
     is_alt = symbol != 'BTC/USDT'
-    filtered_zones = [z for z in zones if z.get('strength', 0) >= 3 and z.get('prob', 0) >= 80]  # RELAXED: from >=85 to >=80
+    filtered_zones = [z for z in zones if z.get('strength', 0) >= 3 and z.get('prob', 0) >= 80] # RELAXED: from >=85 to >=80
     if not filtered_zones:
         return {"no_live_trade": True, "roadmap": []}
     zone_summary = "\n".join([f"{z['direction']}: {z['zone_low']:.4f}-{z['zone_high']:.4f} ({z['confluence']}, {z['prob']}% prob, {z['dist_pct']:.1f}% away, str{z['strength']})" for z in filtered_zones])
@@ -737,7 +739,6 @@ async def find_next_premium_zones(df: pd.DataFrame, current_price: float, tf: st
         trend_bias = 'bear' # Short favor
     else:
         trend_bias = 'neutral' # Both, +1 conf
- 
     if tf in ['1d', '1w']: # Daily focus
         if trend_bias == 'bull' and direction == 'Long':
             conf_score += 2.0 # Mocniejszy boost dla HTF
@@ -962,7 +963,7 @@ def detect_candle_patterns(df: pd.DataFrame, tf: str) -> List[str]:
     upper = c['high'] - max(c['open'], c['close'])
     lower = min(c['open'], c['close']) - c['low']
     range_size = c['high'] - c['low']
-    if body > 0.7 * range_size and df['volume'].iloc[-1] > 1.5 * df['volume_sma'].iloc[-1]:
+    if body > 0.7 * range_size and df['volume'].iloc[-1] > 1.2 * df['volume_sma'].iloc[-1]:
         dir_str = "Bullish" if c['close'] > c['open'] else "Bearish"
         patterns.add(f"{dir_str} Displacement Candle ({tf})")
     if body > 0 and lower > 2 * body and upper < body * 0.3 and c['close'] > p['close']:
@@ -1211,12 +1212,12 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         active = len([t for trades in [open_trades, protected_trades] for t in trades.values() if t.get('active')])
         pending = len([t for t in open_trades.values() if not t.get('active')])
         msg = (
-            "**Grok Elite Bot v24.01.7 - Institutional Hunter Alive!**\n\n"
+            "**Grok Elite Bot v24.01.8 - Institutional Hunter Alive!**\n\n"
             f"**Uptime Check:** {uptime}\n"
             f"**Open Trades:** {open_count}\n"
             f"**Protected Trades:** {protected_count}\n"
             f"**Active:** {active} | **Pending:** {pending}\n"
-            f"**Status:** Zero-noise mode: Str=3 OBs only, 24h cooldown, multi-TF align + Order Flow delta ♔"
+            f"**Status:** Zero-noise: Str=3 OBs, 24h CD, multi-TF + Order Flow delta (relaxed vol 1.2x, delta 0.5%)"
         )
         await update.message.reply_text(msg, parse_mode='Markdown')
         logging.info(f"/health sent successfully")
@@ -1432,7 +1433,7 @@ async def signal_callback(context):
                 triggers.update(normalized_fvgs)
                 candles = detect_candle_patterns(df, tf)
                 triggers.update(candles)
-                if len(df) > 20 and 'volume_sma' in df.columns and not pd.isna(df['volume_sma'].iloc[-1]) and df['volume'].iloc[-1] > 1.5 * df['volume_sma'].iloc[-1]:
+                if len(df) > 20 and 'volume_sma' in df.columns and not pd.isna(df['volume_sma'].iloc[-1]) and df['volume'].iloc[-1] > 1.2 * df['volume_sma'].iloc[-1]:
                     triggers.add(f"Inst Vol Surge ({tf})")
                 obs = await find_unmitigated_order_blocks(df, tf=tf, symbol=symbol)
                 raw_obs = len(obs.get('bullish', []) + obs.get('bearish', []))
@@ -1447,17 +1448,18 @@ async def signal_callback(context):
                             # Retained: Bidirectional triggers
                             dir_str = "Bullish Long" if ob_type == 'bullish' else "Bearish Short"
                             triggers.add(f"Elite {dir_str} OB str3 {dist_pct:.1f}% away ({tf})")
-                # NEW Order Flow: Add delta trigger if |delta| >1%
+                # NEW Order Flow: Add delta trigger if |delta| >0.5%
                 delta = df['order_delta'].iloc[-1] if 'order_delta' in df.columns else 0
-                if abs(delta) > 1.0:
+                if abs(delta) > 0.5:
                     dir_str = "Bullish" if delta > 0 else "Bearish"
                     triggers.add(f"Order Flow {dir_str} Delta {delta:.1f}% ({tf})")
+            logging.info(f"All triggers for {symbol}: {list(triggers)}")
             # Retained: Add 'Bearish Short' to strong keywords for symmetry
             strong_triggers = [t for t in triggers if any(kw in t for kw in ['OB str3', 'Displacement', 'Inst Vol', 'Exhaust', 'Bearish Short', 'Order Flow'])] # NEW: + Order Flow
-            logging.info(f"Elite triggers for {symbol}: {len(strong_triggers)} (min 2 req)")  # RELAXED: from min 3 to min 2
-            if len(strong_triggers) < 2:  # RELAXED: from <3 to <2
+            logging.info(f"Elite triggers for {symbol}: {len(strong_triggers)} (min 1 req)") # RELAXED: from min 3 to min 2
+            if len(strong_triggers) < 1: # RELAXED: from <3 to <2
                 sym_time = time.perf_counter() - sym_start
-                logging.info(f"Skipped {symbol}: <2 elite triggers")
+                logging.info(f"Skipped {symbol}: <1 elite triggers")
                 logging.info(f"Finished {symbol} in {sym_time:.2f}s")
                 continue
             premium_zones = []
@@ -1628,10 +1630,10 @@ async def signal_callback(context):
                     if 'roadmap' in grok_potential and grok_potential['roadmap']:
                         conservative_msg = f"**{symbol.replace('/USDT','')} ELITE ROADMAP** | *Price:* {format_price(price)} | *Trend:* {trend}"
                         if is_alt and btc_trend: conservative_msg += f" | *BTC:* {btc_trend}"
-                        conservative_msg += "\n\nElite inst zones (80%+ conf, str=3):\n"  # RELAXED: from 90% to 80%
+                        conservative_msg += "\n\nElite inst zones (80%+ conf, str=3):\n" # RELAXED: from 90% to 80%
                         roadmap_count = 0
                         for i, z in enumerate(grok_potential['roadmap'], 1):
-                            if z['confidence'] > 80 and z['dist_pct'] < 6 and z.get('strength', 0) == 3:  # RELAXED: conf>80 from 90, dist<6 from 5
+                            if z['confidence'] > 80 and z['dist_pct'] < 6 and z.get('strength', 0) == 3: # RELAXED: conf>80 from 90, dist<6 from 5
                                 roadmap_count += 1
                                 entry_low = min(z['entry_low'], z['entry_high'])
                                 entry_high = max(z['entry_low'], z['entry_high'])
@@ -1728,7 +1730,7 @@ async def signal_callback(context):
                             await bot.send_message(CHAT_ID, conservative_msg, parse_mode='Markdown')
                             last_signal_time[symbol] = now
                             sent_roadmap = True
-                    if not sent_roadmap and len(strong_triggers) >= 2:  # RELAXED: from >=4 to >=2
+                    if not sent_roadmap and len(strong_triggers) >= 1: # RELAXED: from >=4 to >=2
                         trigger_msg = f"**{symbol.replace('/USDT','')} - Elite Triggers** | *Price:* {format_price(price)} | *Trend:* {trend}"
                         if is_alt and btc_trend: trigger_msg += f" | *BTC:* {btc_trend}"
                         trigger_msg += "\n\n__Inst signals:__\n" + '\n'.join([f"• {t}" for t in sorted(strong_triggers[:6])])
