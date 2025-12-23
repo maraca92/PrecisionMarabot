@@ -1,7 +1,14 @@
-# config.py - Grok Elite Signal Bot v27.12.9 - Configuration
+# config.py - Grok Elite Signal Bot v27.12.10 - Configuration
 # -*- coding: utf-8 -*-
 """
 All constants, settings, and environment variables.
+
+v27.12.10 UPDATES:
+- NEW: ROADMAP_MAX_DISTANCE_PCT = 7.0 (only zones within 7% of current price)
+- VERIFIED: RELAXED_MAX_ZONES_TREND = 5 (max 5 trend roadmaps)
+- VERIFIED: RELAXED_MAX_ZONES_STRUCTURAL = 2 (max 2 structural bounces)
+- VERIFIED: MANIPULATION_DETECTION_ENABLED = True
+- Updated get_config_summary() to show new settings
 
 v27.12.9 FIXES:
 - FIXED: STRUCTURAL_EXPECTED_WIN_RATE changed from 0.55 to 65.0 (percentage)
@@ -20,7 +27,7 @@ from typing import List, Dict
 # ============================================================================
 # VERSION
 # ============================================================================
-BOT_VERSION = "27.12.9"
+BOT_VERSION = "27.12.10"
 
 # ============================================================================
 # TRADING PAIRS & TIMEFRAMES
@@ -57,7 +64,7 @@ VOL_SPIKE_ENABLED = False
 USE_STRUCTURE_SL = True
 OB_SCORING_ENABLED = True
 COUNTER_TREND_TP1_ONLY = True
-MANIPULATION_DETECTION_ENABLED = True
+MANIPULATION_DETECTION_ENABLED = True  # v27.12.10: Verified enabled
 
 # Phase 2 features
 SIGNAL_GRADING_ENABLED = True
@@ -431,10 +438,11 @@ LS_CROWDED_LONG = 0.70
 LS_CROWDED_SHORT = 0.30
 
 # ============================================================================
-# v27.12.0: ROADMAP LIMITS (QUALITY FOCUSED)
+# v27.12.10: ROADMAP LIMITS (QUALITY FOCUSED)
 # ============================================================================
-RELAXED_MAX_ZONES_TREND = 5
-RELAXED_MAX_ZONES_STRUCTURAL = 2
+RELAXED_MAX_ZONES_TREND = 5          # v27.12.10: Max 5 trend roadmaps (was 15)
+RELAXED_MAX_ZONES_STRUCTURAL = 2     # v27.12.10: Max 2 structural bounces (was 8)
+ROADMAP_MAX_DISTANCE_PCT = 7.0       # v27.12.10: NEW - Only zones within 7% of price
 
 # ============================================================================
 # v27.12.0: ROADMAP PROXIMITY & CONVERSION
@@ -467,6 +475,11 @@ ROADMAP_ENTRY_PROXIMITY_PCT = 0.5
 ROADMAP_MIN_VOL_SURGE = 1.2
 
 # ============================================================================
+# GROK ROADMAP OPINION (v27.12.3)
+# ============================================================================
+GROK_ROADMAP_OPINION_ENABLED = True
+
+# ============================================================================
 # VALIDATION FUNCTION
 # ============================================================================
 def validate_config():
@@ -484,6 +497,7 @@ def get_config_summary() -> str:
 Grok Elite Bot v{BOT_VERSION} Config:
 - Symbols: {len(SYMBOLS)}
 - Roadmap: {RELAXED_MAX_ZONES_TREND} trend + {RELAXED_MAX_ZONES_STRUCTURAL} structural
+- Max Zone Distance: {ROADMAP_MAX_DISTANCE_PCT}%
 - Proximity cooldown: {ROADMAP_ALERT_COOLDOWN_MINUTES}min
 - TP scaling: Dynamic ATR-based
 - Grading: A>={GRADE_A_THRESHOLD}, B>={GRADE_B_THRESHOLD}, C>={GRADE_C_THRESHOLD}
@@ -494,4 +508,5 @@ Grok Elite Bot v{BOT_VERSION} Config:
 - Grok Models: {GROK_MODELS}
 - Psychology: {'ON' if PSYCHOLOGY_ENABLED else 'OFF'}
 - Structure Detection: {'ON' if STRUCTURE_DETECTION_ENABLED else 'OFF'}
+- Manipulation Detection: {'ON' if MANIPULATION_DETECTION_ENABLED else 'OFF'}
 """
