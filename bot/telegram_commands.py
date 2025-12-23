@@ -1,4 +1,5 @@
-# telegram_commands.py - Grok Elite Signal Bot v27.6.0 - Telegram Commands
+# telegram_commands.py - Grok Elite Signal Bot v27.12.10 - Telegram Commands
+# -*- coding: utf-8 -*-
 """
 Telegram bot commands:
 - /stats - Bot performance statistics
@@ -9,10 +10,11 @@ Telegram bot commands:
 - /validate - Monte Carlo validation
 - /dashboard - Detailed performance metrics
 - /roadmap - Show current roadmap zones (both types)
-- /structural - Show only structural bounce zones (NEW v27.6.0)
+- /structural - Show only structural bounce zones
 - /zones - Alias for /roadmap
 - /commands - Show all available commands
 
+v27.12.10: Updated /commands and /health to show 7% distance filter
 v27.6.0: Added /structural command, updated /roadmap to show both types
 """
 import logging
@@ -33,8 +35,15 @@ from bot.config import (
     TRADE_LOG_FILE, BOT_VERSION, PAPER_TRADING,
     ROADMAP_MIN_OB_STRENGTH, FEE_PCT, STRUCTURAL_TP1_PCT,
     STRUCTURAL_TP2_PCT, STRUCTURAL_EXPECTED_WIN_RATE,
-    STRUCTURAL_EXPECTED_AVG_BOUNCE
+    STRUCTURAL_EXPECTED_AVG_BOUNCE,
+    RELAXED_MAX_ZONES_TREND, RELAXED_MAX_ZONES_STRUCTURAL
 )
+
+# v27.12.10: Import max distance config
+try:
+    from bot.config import ROADMAP_MAX_DISTANCE_PCT
+except ImportError:
+    ROADMAP_MAX_DISTANCE_PCT = 7.0
 from bot.models import load_stats, save_stats_async, HISTORICAL_DATA
 from bot.utils import get_clean_symbol, send_throttled, format_price
 from bot.data_fetcher import fetch_ohlcv, fetch_ticker_batch
@@ -64,7 +73,7 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 - `/stats` - Performance statistics
 - `/factors` - Factor performance analysis
 
-**Roadmap (v27.6.0):**
+**Roadmap (v27.12.10):**
 - `/roadmap` or `/zones` - View all roadmap zones
 - `/structural` - View only structural bounce zones
 - `/genroadmap` - Force roadmap generation
@@ -84,7 +93,7 @@ async def commands_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 - `/recap` - Daily market recap
 - `/commands` - Show this list
 
-**💡 v27.6.0:** Dual roadmaps (Trend + Structural)
+**💡 v27.12.10:** Max 5 trend + 2 structural zones within 7% of price
 Roadmaps generate at 00:05 and 15:00 UTC daily."""
     
     await send_throttled(CHAT_ID, commands, parse_mode='Markdown')
@@ -172,6 +181,7 @@ async def health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"**Protected Trades:** {protected_count}\n"
             f"**Active:** {active} | **Pending:** {pending}\n"
             f"**Roadmap Zones:** {roadmap_count} ({trend_count} trend + {structural_count} structural)\n"
+            f"**Zone Limits:** {RELAXED_MAX_ZONES_TREND} trend + {RELAXED_MAX_ZONES_STRUCTURAL} structural within {ROADMAP_MAX_DISTANCE_PCT}%\n"
             f"**Status:** All systems operational ✅"
         )
         
