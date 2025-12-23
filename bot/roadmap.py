@@ -1,6 +1,15 @@
-# roadmap.py - Grok Elite Signal Bot v27.12.3 - Dual Roadmap System
+# roadmap.py - Grok Elite Signal Bot v27.12.10 - Dual Roadmap System
 # -*- coding: utf-8 -*-
 """
+v27.12.10: ROADMAP DISTANCE FILTER
+
+CHANGES:
+1. Added ROADMAP_MAX_DISTANCE_PCT import (7% max distance)
+2. Added filter_zones_by_distance() function
+3. Updated generate_trend_roadmap_zones() to use 7% filter
+4. Applied filter in roadmap_generation_callback() before selection
+5. Maintained all v27.12.3 Grok opinion features
+
 v27.12.3: GROK OPINION INTEGRATION FOR ROADMAPS
 
 CHANGES:
@@ -39,12 +48,18 @@ except ImportError:
     ROADMAP_MIN_VOL_SURGE = 1.2
     ROADMAP_MIN_DEPTH_BTC = 300000
     ROADMAP_MIN_DEPTH_ALT = 150000
-    RELAXED_MAX_ZONES_TREND = 15
-    RELAXED_MAX_ZONES_STRUCTURAL = 8
+    RELAXED_MAX_ZONES_TREND = 5
+    RELAXED_MAX_ZONES_STRUCTURAL = 2
     RELAXED_MIN_OB_STRENGTH = 1.5
     RELAXED_MIN_CONFIDENCE = 55
     GROK_OPINION_ENABLED = True
     GROK_ROADMAP_OPINION_ENABLED = True
+
+# v27.12.10: Import max distance config
+try:
+    from bot.config import ROADMAP_MAX_DISTANCE_PCT
+except ImportError:
+    ROADMAP_MAX_DISTANCE_PCT = 7.0  # Default to 7%
 
 from bot.utils import send_throttled, format_price, calculate_zone_proximity
 from bot.models import (
@@ -81,6 +96,54 @@ ROADMAP_ALERT_COOLDOWN_MINUTES = 120
 # ============================================================================
 roadmap_zones: Dict[str, List[Dict]] = {}
 data_cache: Dict[str, Dict[str, pd.DataFrame]] = {}
+
+
+# ============================================================================
+# v27.12.10: FILTER ZONES BY DISTANCE
+# ============================================================================
+def filter_zones_by_distance(zones: List[Dict], prices: Dict, max_distance_pct: float = None) -> List[Dict]:
+    """
+    Filter zones to only include those within max_distance_pct of current price.
+    v27.12.10: NEW FUNCTION
+    
+    Args:
+        zones: List of zone dicts
+        prices: Dict of current prices by symbol
+        max_distance_pct: Maximum distance from current price (default: ROADMAP_MAX_DISTANCE_PCT)
+    
+    Returns:
+        Filtered list of zones within distance threshold
+    """
+    if max_distance_pct is None:
+        max_distance_pct = ROADMAP_MAX_DISTANCE_PCT
+    
+    filtered = []
+    rejected_count = 0
+    
+    for zone in zones:
+        symbol = zone.get('symbol')
+        price = prices.get(symbol, 0)
+        
+        if price <= 0:
+            continue
+        
+        zone_low = zone.get('zone_low', zone.get('entry_low', 0))
+        zone_high = zone.get('zone_high', zone.get('entry_high', 0))
+        zone_mid = (zone_low + zone_high) / 2
+        
+        dist_pct = abs(price - zone_mid) / price * 100
+        
+        if dist_pct <= max_distance_pct:
+            zone['dist_pct'] = dist_pct  # Store distance for logging
+            filtered.append(zone)
+        else:
+            rejected_count += 1
+            logging.debug(f"{symbol}: Zone rejected - {dist_pct:.1f}% > {max_distance_pct}% max distance")
+    
+    if rejected_count > 0:
+        logging.info(f"Distance filter: {rejected_count} zones rejected (>{max_distance_pct}%)")
+    
+    return filtered
 
 
 # ============================================================================
@@ -287,7 +350,7 @@ async def send_roadmap_batch(zones: List[Dict], zone_type: str, prices: Dict, bt
 
 
 # ============================================================================
-# TREND ROADMAP ZONE GENERATION
+# TREND ROADMAP ZONE GENERATION - v27.12.10 Updated
 # ============================================================================
 async def generate_trend_roadmap_zones(
     symbol: str,
@@ -296,7 +359,10 @@ async def generate_trend_roadmap_zones(
     price: float,
     btc_trend: str
 ) -> List[Dict]:
-    """Generate trend-following roadmap zones for a symbol."""
+    """
+    Generate trend-following roadmap zones for a symbol.
+    v27.12.10: Uses ROADMAP_MAX_DISTANCE_PCT (7%) for distance filter.
+    """
     zones = []
     
     try:
@@ -355,8 +421,8 @@ async def generate_trend_roadmap_zones(
             ob_mid = (ob_low + ob_high) / 2
             dist_pct = abs(price - ob_mid) / price * 100
             
-            # Distance filter
-            if dist_pct > 15.0:
+            # v27.12.10: Distance filter using ROADMAP_MAX_DISTANCE_PCT (7%)
+            if dist_pct > ROADMAP_MAX_DISTANCE_PCT:
                 rejected['distance'] += 1
                 continue
             
@@ -423,7 +489,8 @@ async def generate_trend_roadmap_zones(
                 'created_at': datetime.now(timezone.utc),
                 'converted': False,
                 'grok_opinion': 'neutral',
-                'grok_display': ''
+                'grok_display': '',
+                'dist_pct': dist_pct  # v27.12.10: Store distance
             }
             
             entry_mid = (ob_low + ob_high) / 2
@@ -452,7 +519,7 @@ async def generate_trend_roadmap_zones(
             zones.append(zone)
         
         logging.info(f"{symbol}: Rejected OBs - Distance:{rejected['distance']} Strength:{rejected['strength']} Position:{rejected['position']} Confidence:{rejected['confidence']}")
-        logging.info(f"{symbol}: Generated {len(zones)} roadmap zones from {len(all_obs)} OBs")
+        logging.info(f"{symbol}: Generated {len(zones)} roadmap zones from {len(all_obs)} OBs (max dist: {ROADMAP_MAX_DISTANCE_PCT}%)")
         
     except Exception as e:
         logging.error(f"{symbol}: Trend zone generation error: {e}")
@@ -463,10 +530,13 @@ async def generate_trend_roadmap_zones(
 
 
 # ============================================================================
-# MAIN ROADMAP GENERATION CALLBACK
+# MAIN ROADMAP GENERATION CALLBACK - v27.12.10 Updated
 # ============================================================================
 async def roadmap_generation_callback(data_cache: Dict, btc_trend: str):
-    """Generate roadmaps for all symbols."""
+    """
+    Generate roadmaps for all symbols.
+    v27.12.10: Added filter_zones_by_distance() before selection.
+    """
     global roadmap_zones
     
     prices = await fetch_ticker_batch()
@@ -514,6 +584,9 @@ async def roadmap_generation_callback(data_cache: Dict, btc_trend: str):
             logging.debug(traceback.format_exc())
             continue
     
+    # v27.12.10: Filter zones by distance BEFORE sorting and selection
+    trend_zones_all = filter_zones_by_distance(trend_zones_all, prices, ROADMAP_MAX_DISTANCE_PCT)
+    
     # Sort and select top zones
     trend_zones_all = sorted(trend_zones_all, key=lambda z: z['confidence'], reverse=True)
     
@@ -533,7 +606,7 @@ async def roadmap_generation_callback(data_cache: Dict, btc_trend: str):
         if len(selected_trend_zones) >= RELAXED_MAX_ZONES_TREND:
             break
     
-    logging.info(f"Found {len(trend_zones_all)} total trend zones, selected {len(selected_trend_zones)}")
+    logging.info(f"Found {len(trend_zones_all)} total trend zones, selected {len(selected_trend_zones)} (max {RELAXED_MAX_ZONES_TREND})")
     
     # Generate structural roadmap
     structural_zones_all = []
@@ -545,7 +618,10 @@ async def roadmap_generation_callback(data_cache: Dict, btc_trend: str):
         except Exception as e:
             logging.error(f"Structural bounce detection error: {e}")
     
-    logging.info(f"Found {len(structural_zones_all)} structural zones")
+    # v27.12.10: Filter structural zones by distance as well
+    structural_zones_all = filter_zones_by_distance(structural_zones_all, prices, ROADMAP_MAX_DISTANCE_PCT)
+    
+    logging.info(f"Found {len(structural_zones_all)} structural zones after {ROADMAP_MAX_DISTANCE_PCT}% filter")
     
     selected_structural_zones = structural_zones_all[:RELAXED_MAX_ZONES_STRUCTURAL]
     
@@ -568,7 +644,7 @@ async def roadmap_generation_callback(data_cache: Dict, btc_trend: str):
     trend_count = len(selected_trend_zones)
     structural_count = len(selected_structural_zones)
     
-    logging.info(f"Roadmap generation complete: {total_zones} zones ({trend_count} trend + {structural_count} structural)")
+    logging.info(f"Roadmap generation complete: {total_zones} zones ({trend_count} trend + {structural_count} structural) within {ROADMAP_MAX_DISTANCE_PCT}%")
     
     # Send formatted messages with Grok opinions
     if total_zones > 0:
@@ -581,7 +657,7 @@ async def roadmap_generation_callback(data_cache: Dict, btc_trend: str):
     else:
         await send_throttled(
             CHAT_ID,
-            "⚠️ **No roadmap zones generated**\n_Market conditions may not favor clear setups_",
+            f"⚠️ **No roadmap zones generated**\n_No zones found within {ROADMAP_MAX_DISTANCE_PCT}% of current prices_",
             parse_mode='Markdown'
         )
 
