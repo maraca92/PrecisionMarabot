@@ -1,7 +1,13 @@
-# main.py - Grok Elite Signal Bot v27.12.9 - Main Orchestration
+# main.py - Grok Elite Signal Bot v27.12.10 - Main Orchestration
 # -*- coding: utf-8 -*-
 """
 Main entry point - Claude-only signal generation with full module integration.
+
+v27.12.10 UPDATES:
+1. Added manipulation detector imports with proper try/except
+2. MANIPULATION_AVAILABLE flag for runtime checks
+3. Verified config imports include MANIPULATION_DETECTION_ENABLED
+4. All v27.12.9 fixes preserved
 
 v27.12.9: Use this ORIGINAL WORKING version from v27.12.1
 - Fixed config STRUCTURAL_EXPECTED_WIN_RATE to 65.0 (was 0.55)
@@ -81,7 +87,8 @@ from bot.config import (
     OB_MIN_QUALITY_SCORE, COUNTER_TREND_TP1_ONLY,
     SIGNAL_GRADING_ENABLED, GROK_OPINION_ENABLED,
     STRUCTURE_DETECTION_ENABLED, PSYCHOLOGY_ENABLED,
-    MIN_CONFLUENCE_LIVE, MIN_CONFLUENCE_ROADMAP, EXECUTABLE_GRADES
+    MIN_CONFLUENCE_LIVE, MIN_CONFLUENCE_ROADMAP, EXECUTABLE_GRADES,
+    MANIPULATION_DETECTION_ENABLED  # v27.12.10: Added
 )
 
 # Safe config imports with fallbacks
@@ -302,6 +309,16 @@ try:
 except ImportError:
     async def detect_structural_bounces_batch(*args): return {}
     def validate_structural_zone(*args): return False, {}
+
+# v27.12.10: Manipulation detector imports
+try:
+    from bot.manipulation import manipulation_detector, ManipulationDetector
+    MANIPULATION_AVAILABLE = True
+    logging.info("Manipulation detector loaded successfully")
+except ImportError:
+    MANIPULATION_AVAILABLE = False
+    manipulation_detector = None
+    logging.warning("Manipulation detector not available")
 
 # ============================================================================
 # GLOBAL STATE
