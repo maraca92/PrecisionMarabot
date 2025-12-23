@@ -1,6 +1,13 @@
-# structural_bounce.py - Grok Elite Signal Bot v27.10.1 - Structural Bounces
+# structural_bounce.py - Grok Elite Signal Bot v27.12.10 - Structural Bounces
+# -*- coding: utf-8 -*-
 """
 Detect structural bounce opportunities at psychological levels.
+
+v27.12.10 UPDATES:
+1. Added ROADMAP_MAX_DISTANCE_PCT import (7% max distance)
+2. Updated find_nearest_psychological_level() to use 7% instead of 15%
+3. Added zone distance check in detection loop
+4. All v27.10.1 features maintained (dynamic ATR TPs, max 2 zones)
 
 v27.10.1 IMPROVEMENTS:
 1. Dynamic TP calculations using ATR (2x and 4x for TP1/TP2) instead of fixed %
@@ -12,7 +19,7 @@ v27.10.1 IMPROVEMENTS:
 import logging
 import asyncio
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import pandas as pd
 import numpy as np
 
@@ -24,6 +31,13 @@ from bot.config import (
     RELAXED_MAX_ZONES_STRUCTURAL, RELAXED_MIN_OB_STRENGTH,
     RELAXED_MIN_CONFIDENCE
 )
+
+# v27.12.10: Import max distance config
+try:
+    from bot.config import ROADMAP_MAX_DISTANCE_PCT
+except ImportError:
+    ROADMAP_MAX_DISTANCE_PCT = 7.0  # Default to 7% if not in config
+
 from bot.indicators import add_institutional_indicators
 from bot.order_blocks import find_unmitigated_order_blocks
 
@@ -51,7 +65,7 @@ def calculate_structural_tp(
     entry_mid: float,
     direction: str,
     atr: float
-) -> tuple[float, float]:
+) -> Tuple[float, float]:
     """
     Calculate TP1 and TP2 for structural bounces.
     v27.10.1: Uses ATR multipliers (2x and 4x) instead of fixed percentages.
@@ -81,12 +95,19 @@ def calculate_structural_tp(
 
 
 # ============================================================================
-# FIND NEAREST PSYCHOLOGICAL LEVEL
+# FIND NEAREST PSYCHOLOGICAL LEVEL - v27.12.10 Updated
 # ============================================================================
 def find_nearest_psychological_level(symbol: str, price: float) -> Optional[float]:
     """
     Find the nearest psychological level for a symbol.
-    Returns None if no level within 15% of price.
+    v27.12.10: Only returns level if within ROADMAP_MAX_DISTANCE_PCT (7%) of price.
+    
+    Args:
+        symbol: Trading pair
+        price: Current price
+    
+    Returns:
+        Nearest psychological level or None if too far
     """
     levels = PSYCHOLOGICAL_LEVELS.get(symbol, [])
     if not levels:
@@ -95,16 +116,16 @@ def find_nearest_psychological_level(symbol: str, price: float) -> Optional[floa
     # Find closest level
     closest = min(levels, key=lambda x: abs(x - price))
     
-    # Only return if within 15% of current price
+    # v27.12.10: Only return if within ROADMAP_MAX_DISTANCE_PCT of current price
     dist_pct = abs(price - closest) / price * 100
-    if dist_pct <= 15.0:
+    if dist_pct <= ROADMAP_MAX_DISTANCE_PCT:
         return closest
     
     return None
 
 
 # ============================================================================
-# DETECT STRUCTURAL BOUNCES - v27.10.1 (With Dynamic TPs)
+# DETECT STRUCTURAL BOUNCES - v27.12.10 (With 7% Distance Filter)
 # ============================================================================
 async def detect_structural_bounces_batch(
     data_cache: Dict,
@@ -113,6 +134,7 @@ async def detect_structural_bounces_batch(
 ) -> List[Dict]:
     """
     Detect structural bounce opportunities at psychological levels.
+    v27.12.10: Only zones within ROADMAP_MAX_DISTANCE_PCT (7%) of current price.
     v27.10.1: Improved TP calculations using ATR, max 2 zones.
     
     Args:
@@ -132,14 +154,15 @@ async def detect_structural_bounces_batch(
             if price is None:
                 continue
             
-            # Find nearest psychological level
+            # v27.12.10: Find nearest psychological level (now respects 7% limit)
             psych_level = find_nearest_psychological_level(symbol, price)
             if psych_level is None:
+                logging.debug(f"{symbol}: No psychological level within {ROADMAP_MAX_DISTANCE_PCT}%")
                 continue
             
             dist_to_level = abs(price - psych_level) / price * 100
             
-            # Only consider if close to level (within 8%)
+            # Only consider if close to level (within 8% for entry)
             if dist_to_level > 8.0:
                 continue
             
@@ -166,6 +189,12 @@ async def detect_structural_bounces_batch(
                     # OB should be near psychological level
                     ob_dist = abs(ob_mid - psych_level) / psych_level * 100
                     if ob_dist > 5.0:
+                        continue
+                    
+                    # v27.12.10: Check zone distance from current price
+                    zone_dist_pct = abs(price - ob_mid) / price * 100
+                    if zone_dist_pct > ROADMAP_MAX_DISTANCE_PCT:
+                        logging.debug(f"{symbol}: Long OB zone too far ({zone_dist_pct:.1f}% > {ROADMAP_MAX_DISTANCE_PCT}%)")
                         continue
                     
                     # Build zone
@@ -235,7 +264,8 @@ async def detect_structural_bounces_batch(
                         'created_at': datetime.now(timezone.utc),
                         'timeframe': '1d',
                         'converted': False,
-                        'alert_count': 0
+                        'alert_count': 0,
+                        'dist_pct': zone_dist_pct  # v27.12.10: Store distance
                     }
                     
                     structural_zones.append(zone)
@@ -252,6 +282,12 @@ async def detect_structural_bounces_batch(
                     # OB should be near psychological level
                     ob_dist = abs(ob_mid - psych_level) / psych_level * 100
                     if ob_dist > 5.0:
+                        continue
+                    
+                    # v27.12.10: Check zone distance from current price
+                    zone_dist_pct = abs(price - ob_mid) / price * 100
+                    if zone_dist_pct > ROADMAP_MAX_DISTANCE_PCT:
+                        logging.debug(f"{symbol}: Short OB zone too far ({zone_dist_pct:.1f}% > {ROADMAP_MAX_DISTANCE_PCT}%)")
                         continue
                     
                     # Build zone
@@ -321,7 +357,8 @@ async def detect_structural_bounces_batch(
                         'created_at': datetime.now(timezone.utc),
                         'timeframe': '1d',
                         'converted': False,
-                        'alert_count': 0
+                        'alert_count': 0,
+                        'dist_pct': zone_dist_pct  # v27.12.10: Store distance
                     }
                     
                     structural_zones.append(zone)
@@ -333,20 +370,22 @@ async def detect_structural_bounces_batch(
             logging.error(f"{symbol}: Structural bounce detection error: {e}")
             continue
     
-    # Sort by confidence and return top zones
+    # Sort by confidence and return top zones (v27.12.10: max 2)
     structural_zones = sorted(structural_zones, key=lambda z: z['confidence'], reverse=True)
+    structural_zones = structural_zones[:RELAXED_MAX_ZONES_STRUCTURAL]
     
-    logging.info(f"Structural bounce detection complete: {len(structural_zones)} zones found")
+    logging.info(f"Structural bounce detection: {len(structural_zones)} zones (max {RELAXED_MAX_ZONES_STRUCTURAL}, within {ROADMAP_MAX_DISTANCE_PCT}%)")
     
     return structural_zones
 
 
 # ============================================================================
-# VALIDATE STRUCTURAL ZONE
+# VALIDATE STRUCTURAL ZONE - v27.12.10 Updated
 # ============================================================================
-def validate_structural_zone(symbol: str, zone: Dict, current_price: float) -> tuple[bool, Dict]:
+def validate_structural_zone(symbol: str, zone: Dict, current_price: float) -> Tuple[bool, Dict]:
     """
     Validate a structural bounce zone before conversion.
+    v27.12.10: Uses ROADMAP_MAX_DISTANCE_PCT for distance threshold.
     
     Args:
         symbol: Trading pair
@@ -359,14 +398,14 @@ def validate_structural_zone(symbol: str, zone: Dict, current_price: float) -> t
     
     checks = {}
     
-    # 1. Distance check (must be within 8%)
+    # 1. Distance check (v27.12.10: use ROADMAP_MAX_DISTANCE_PCT instead of 8.0)
     zone_mid = (zone['zone_low'] + zone['zone_high']) / 2
     dist_pct = abs(current_price - zone_mid) / current_price * 100
     
     checks['distance'] = {
-        'passed': dist_pct <= 8.0,
+        'passed': dist_pct <= ROADMAP_MAX_DISTANCE_PCT,
         'value': dist_pct,
-        'threshold': 8.0,
+        'threshold': ROADMAP_MAX_DISTANCE_PCT,
         'label': f'Distance {dist_pct:.1f}%'
     }
     
