@@ -419,6 +419,17 @@ def count_confluence_factors(
     """Count total confluence factors for a trade."""
     count = 0
     factors = []
+    
+    # v27.12.11: Sanitize inputs - ensure they are dicts, not exceptions
+    def safe_dict(obj):
+        return obj if isinstance(obj, dict) else None
+    
+    trade = safe_dict(trade) or {}
+    momentum_data = safe_dict(momentum_data)
+    divergence_data = safe_dict(divergence_data)
+    funding_data = safe_dict(funding_data)
+    oi_data = safe_dict(oi_data)
+    volume_comparison = safe_dict(volume_comparison)
 
     zone_confluence = trade.get('confluence', '')
     if 'OB' in zone_confluence or 'Order Block' in zone_confluence:
@@ -497,12 +508,15 @@ async def fetch_cross_exchange_data_fast(symbol: str) -> Dict:
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        if not isinstance(results[0], Exception):
+        # v27.12.11: Check for BaseException (includes CancelledError) not just Exception
+        if not isinstance(results[0], BaseException):
             result['divergence_data'] = results[0]
-        if not isinstance(results[1], Exception):
+        if not isinstance(results[1], BaseException):
             result['funding_data'] = results[1]
-        if not isinstance(results[2], Exception):
+        if not isinstance(results[2], BaseException):
             result['volume_comparison'] = results[2]
+    except asyncio.CancelledError:
+        logging.debug(f"{symbol}: Cross-exchange fetch cancelled")
     except Exception as e:
         logging.debug(f"{symbol}: Cross-exchange fetch error: {e}")
     return result
