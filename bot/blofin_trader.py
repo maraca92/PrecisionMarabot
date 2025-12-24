@@ -128,10 +128,14 @@ class BlofinClient:
         timestamp = str(int(datetime.now().timestamp() * 1000))
         nonce = str(uuid4())
         
-        # Build prehash string
-        prehash = f"{path}{method}{timestamp}{nonce}"
+        # Build prehash string - body is "" for GET, json string for POST
+        # v27.12.11: Fixed to match official Blofin SDK format
         if body:
-            prehash += json.dumps(body, separators=(',', ':'))
+            body_str = json.dumps(body)
+        else:
+            body_str = ""
+        
+        prehash = f"{path}{method}{timestamp}{nonce}{body_str}"
         
         # Generate HMAC-SHA256 signature
         hex_signature = hmac.new(
