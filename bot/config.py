@@ -1,7 +1,14 @@
-# config.py - Grok Elite Signal Bot v27.12.10 - Configuration
+# config.py - Grok Elite Signal Bot v27.12.11 - Configuration
 # -*- coding: utf-8 -*-
 """
 All constants, settings, and environment variables.
+
+v27.12.11 UPDATES:
+- NEW: Blofin Auto-Trading Integration
+- NEW: BLOFIN_API_KEY, BLOFIN_SECRET_KEY, BLOFIN_PASSPHRASE environment variables
+- NEW: AUTO_TRADE_ENABLED, AUTO_TRADE_RISK_PCT, AUTO_TRADE_LEVERAGE settings
+- NEW: is_blofin_configured() and get_blofin_config_summary() functions
+- All v27.12.10 settings preserved
 
 v27.12.10 UPDATES:
 - NEW: ROADMAP_MAX_DISTANCE_PCT = 7.0 (only zones within 7% of current price)
@@ -27,7 +34,7 @@ from typing import List, Dict
 # ============================================================================
 # VERSION
 # ============================================================================
-BOT_VERSION = "27.12.10"
+BOT_VERSION = "27.12.11"
 
 # ============================================================================
 # TRADING PAIRS & TIMEFRAMES
@@ -56,6 +63,64 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 PAPER_TRADING = os.getenv("PAPER_TRADING", "true").lower() == "true"
 RENDER_EXTERNAL_HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME")
 PORT = int(os.getenv("PORT", 10000))
+
+# ============================================================================
+# BLOFIN AUTO-TRADING CONFIGURATION (v27.12.11)
+# ============================================================================
+BLOFIN_API_KEY = os.getenv("BLOFIN_API_KEY")
+BLOFIN_SECRET_KEY = os.getenv("BLOFIN_SECRET_KEY")
+BLOFIN_PASSPHRASE = os.getenv("BLOFIN_PASSPHRASE")
+
+# Trading Mode
+BLOFIN_DEMO_MODE = os.getenv("BLOFIN_DEMO_MODE", "false").lower() == "true"
+
+# Auto-Trading Settings
+AUTO_TRADE_ENABLED = os.getenv("AUTO_TRADE_ENABLED", "false").lower() == "true"
+AUTO_TRADE_RISK_PCT = float(os.getenv("AUTO_TRADE_RISK_PCT", "0.015"))  # 1.5% per trade
+AUTO_TRADE_MAX_LEVERAGE = int(os.getenv("AUTO_TRADE_MAX_LEVERAGE", "5"))
+AUTO_TRADE_DEFAULT_LEVERAGE = int(os.getenv("AUTO_TRADE_DEFAULT_LEVERAGE", "3"))
+AUTO_TRADE_MARGIN_MODE = os.getenv("AUTO_TRADE_MARGIN_MODE", "isolated")
+AUTO_TRADE_POSITION_MODE = os.getenv("AUTO_TRADE_POSITION_MODE", "net_mode")
+AUTO_TRADE_MIN_GRADE = os.getenv("AUTO_TRADE_MIN_GRADE", "B")
+
+# Blofin API Endpoints
+BLOFIN_BASE_URL = "https://demo-trading-openapi.blofin.com" if BLOFIN_DEMO_MODE else "https://openapi.blofin.com"
+BLOFIN_WS_PUBLIC = f"wss://{'demo-trading-' if BLOFIN_DEMO_MODE else ''}openapi.blofin.com/ws/public"
+BLOFIN_WS_PRIVATE = f"wss://{'demo-trading-' if BLOFIN_DEMO_MODE else ''}openapi.blofin.com/ws/private"
+
+# Symbol mapping (Grok format -> Blofin format)
+BLOFIN_SYMBOL_MAP = {
+    "BTC/USDT": "BTC-USDT",
+    "ETH/USDT": "ETH-USDT",
+    "SOL/USDT": "SOL-USDT",
+    "BNB/USDT": "BNB-USDT",
+    "XRP/USDT": "XRP-USDT",
+    "ADA/USDT": "ADA-USDT",
+    "AVAX/USDT": "AVAX-USDT",
+}
+
+def is_blofin_configured() -> bool:
+    """Check if Blofin API credentials are configured"""
+    return bool(BLOFIN_API_KEY and BLOFIN_SECRET_KEY and BLOFIN_PASSPHRASE)
+
+def get_blofin_config_summary() -> str:
+    """Get Blofin configuration summary for status display"""
+    if not is_blofin_configured():
+        return "❌ Blofin: Not Configured"
+    
+    status = "🟢" if AUTO_TRADE_ENABLED else "🟡"
+    mode = "DEMO" if BLOFIN_DEMO_MODE else "LIVE"
+    
+    return f"""
+{status} **Blofin Auto-Trading**
+├─ Mode: {mode}
+├─ Enabled: {AUTO_TRADE_ENABLED}
+├─ Risk/Trade: {AUTO_TRADE_RISK_PCT*100:.1f}%
+├─ Max Leverage: {AUTO_TRADE_MAX_LEVERAGE}x
+├─ Default Leverage: {AUTO_TRADE_DEFAULT_LEVERAGE}x
+├─ Margin Mode: {AUTO_TRADE_MARGIN_MODE}
+└─ Min Grade: {AUTO_TRADE_MIN_GRADE}
+"""
 
 # ============================================================================
 # FEATURE FLAGS
@@ -493,6 +558,9 @@ def validate_config():
 # ============================================================================
 def get_config_summary() -> str:
     """Get summary of config for logging."""
+    blofin_status = "ON" if is_blofin_configured() and AUTO_TRADE_ENABLED else "OFF"
+    blofin_mode = "DEMO" if BLOFIN_DEMO_MODE else "LIVE"
+    
     return f"""
 Grok Elite Bot v{BOT_VERSION} Config:
 - Symbols: {len(SYMBOLS)}
@@ -509,4 +577,5 @@ Grok Elite Bot v{BOT_VERSION} Config:
 - Psychology: {'ON' if PSYCHOLOGY_ENABLED else 'OFF'}
 - Structure Detection: {'ON' if STRUCTURE_DETECTION_ENABLED else 'OFF'}
 - Manipulation Detection: {'ON' if MANIPULATION_DETECTION_ENABLED else 'OFF'}
+- Blofin Auto-Trade: {blofin_status} ({blofin_mode})
 """
