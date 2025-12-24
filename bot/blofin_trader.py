@@ -385,7 +385,8 @@ class BlofinClient:
             "positionSide": position_side,
             "side": side,
             "orderType": order_type,
-            "size": str(size)
+            "size": str(size),
+            "brokerId": "grok_elite"  # v27.12.11: Required for third-party API keys
         }
         
         if order_type != "market" and price:
@@ -432,7 +433,8 @@ class BlofinClient:
             "positionSide": position_side,
             "side": side,
             "size": str(size),
-            "reduceOnly": "true" if reduce_only else "false"
+            "reduceOnly": "true" if reduce_only else "false",
+            "brokerId": "grok_elite"  # v27.12.11: Required for third-party API keys
         }
         
         if tp_trigger_price:
@@ -455,7 +457,11 @@ class BlofinClient:
         response = await self._request(
             "POST",
             "/api/v1/trade/cancel-order",
-            body={"instId": inst_id, "orderId": order_id}
+            body={
+                "instId": inst_id,
+                "orderId": order_id,
+                "brokerId": "grok_elite"  # v27.12.11: Required
+            }
         )
         return response.get("code") == "0"
     
@@ -465,7 +471,11 @@ class BlofinClient:
         response = await self._request(
             "POST",
             "/api/v1/trade/cancel-tpsl",
-            body={"instId": inst_id, "tpslId": tpsl_id}
+            body={
+                "instId": inst_id,
+                "tpslId": tpsl_id,
+                "brokerId": "grok_elite"  # v27.12.11: Required
+            }
         )
         return response.get("code") == "0"
     
@@ -483,7 +493,8 @@ class BlofinClient:
             body={
                 "instId": inst_id,
                 "marginMode": margin_mode,
-                "positionSide": position_side
+                "positionSide": position_side,
+                "brokerId": "grok_elite"  # v27.12.11: Required for third-party API keys
             }
         )
         return response.get("data", {})
