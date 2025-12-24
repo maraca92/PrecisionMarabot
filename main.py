@@ -765,8 +765,19 @@ async def signal_callback(context):
             for i, r in enumerate(oi_results)
         }
 
-        fear_greed_data = await get_fear_greed() if PSYCHOLOGY_ENABLED else None
+        # v27.12.11: Wrap async data fetching in try/except to prevent CancelledError propagation
+        fear_greed_data = None
         long_short_data = None
+        
+        if PSYCHOLOGY_ENABLED:
+            try:
+                fear_greed_data = await get_fear_greed()
+            except asyncio.CancelledError:
+                logging.warning("Fear & Greed fetch cancelled")
+                fear_greed_data = None
+            except Exception as e:
+                logging.debug(f"Fear & Greed fetch error: {e}")
+                fear_greed_data = None
 
         signals_sent = 0
         analyzed = 0
