@@ -1252,9 +1252,13 @@ async def signal_callback(context):
         cycle_duration = time.time() - cycle_start
         logging.info("=" * 70)
         logging.info(f"=== CYCLE COMPLETE: {cycle_duration:.1f}s | Analyzed: {analyzed} | Skipped: {skipped} | Signals: {signals_sent} ===")
+        
+        # v27.12.11: Print summary for Render visibility
+        print(f"[SIGNAL] Cycle complete: {cycle_duration:.1f}s | Analyzed: {analyzed} | Signals: {signals_sent}", flush=True)
 
     except Exception as e:
         logging.error(f"Signal callback error: {e}")
+        print(f"[ERROR] Signal callback: {e}", flush=True)
         import traceback
         logging.error(traceback.format_exc())
 
@@ -1391,6 +1395,7 @@ async def roadmap_scheduled_callback(context):
     """Check if it's time to generate roadmaps and monitor proximity."""
     try:
         if is_roadmap_generation_time():
+            print(f"[ROADMAP] Generating roadmaps at {datetime.now(timezone.utc).strftime('%H:%M')} UTC", flush=True)
             await roadmap_generation_callback(data_cache, btc_trend_global)
 
         from bot.roadmap import monitor_roadmap_proximity
@@ -1398,6 +1403,7 @@ async def roadmap_scheduled_callback(context):
 
     except Exception as e:
         logging.error(f"Roadmap callback error: {e}")
+        print(f"[ERROR] Roadmap callback: {e}", flush=True)
 
 
 async def daily_callback(context):
