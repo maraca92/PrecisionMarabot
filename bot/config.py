@@ -106,20 +106,20 @@ def is_blofin_configured() -> bool:
 def get_blofin_config_summary() -> str:
     """Get Blofin configuration summary for status display"""
     if not is_blofin_configured():
-        return "❌ Blofin: Not Configured"
+        return "Blofin: Not Configured"
     
-    status = "🟢" if AUTO_TRADE_ENABLED else "🟡"
+    status = "ON" if AUTO_TRADE_ENABLED else "OFF"
     mode = "DEMO" if BLOFIN_DEMO_MODE else "LIVE"
     
     return f"""
-{status} **Blofin Auto-Trading**
-├─ Mode: {mode}
-├─ Enabled: {AUTO_TRADE_ENABLED}
-├─ Risk/Trade: {AUTO_TRADE_RISK_PCT*100:.1f}%
-├─ Max Leverage: {AUTO_TRADE_MAX_LEVERAGE}x
-├─ Default Leverage: {AUTO_TRADE_DEFAULT_LEVERAGE}x
-├─ Margin Mode: {AUTO_TRADE_MARGIN_MODE}
-└─ Min Grade: {AUTO_TRADE_MIN_GRADE}
+**Blofin Auto-Trading**
+- Mode: {mode}
+- Enabled: {AUTO_TRADE_ENABLED}
+- Risk/Trade: {AUTO_TRADE_RISK_PCT*100:.1f}%
+- Max Leverage: {AUTO_TRADE_MAX_LEVERAGE}x
+- Default Leverage: {AUTO_TRADE_DEFAULT_LEVERAGE}x
+- Margin Mode: {AUTO_TRADE_MARGIN_MODE}
+- Min Grade: {AUTO_TRADE_MIN_GRADE}
 """
 
 # ============================================================================
