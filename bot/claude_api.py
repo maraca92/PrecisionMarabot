@@ -220,6 +220,32 @@ def build_claude_context_v2(
 ) -> str:
     """Build comprehensive context for Claude analysis."""
     
+    # v27.12.11: Sanitize all optional dict parameters - ensure they're actually dicts
+    def safe_dict(obj):
+        """Return obj if it's a dict, otherwise None"""
+        return obj if isinstance(obj, dict) else None
+    
+    # Sanitize all inputs that might be exceptions
+    vol_data = safe_dict(vol_data)
+    fear_greed = safe_dict(fear_greed)
+    long_short_ratio = safe_dict(long_short_ratio)
+    stop_hunt_result = safe_dict(stop_hunt_result)
+    fake_breakout_result = safe_dict(fake_breakout_result)
+    structure_break = safe_dict(structure_break)
+    ote_data = safe_dict(ote_data)
+    oi_data = safe_dict(oi_data)
+    funding_data = safe_dict(funding_data)
+    divergence_data = safe_dict(divergence_data)
+    momentum_data = safe_dict(momentum_data)
+    volume_comparison = safe_dict(volume_comparison)
+    orderbook_data = safe_dict(orderbook_data)
+    
+    # Sanitize list parameters
+    if manipulation_signals is not None and not isinstance(manipulation_signals, list):
+        manipulation_signals = None
+    if premium_zones is not None and not isinstance(premium_zones, list):
+        premium_zones = []
+    
     context = f"""# Market Analysis for {symbol}
 
 ## Current State
@@ -269,17 +295,20 @@ def build_claude_context_v2(
         elif ratio <= 0.5:
             context += f"  CROWDED SHORT - Favor Long direction\n"
     
-    # Wick detection
-    if wick_result and hasattr(wick_result, 'detected') and wick_result.detected:
-        context += "\n## WICK SIGNAL DETECTED\n\n"
-        context += f"- **Type:** {wick_result.wick_type.value if hasattr(wick_result.wick_type, 'value') else wick_result.wick_type}\n"
-        context += f"- **Direction:** {wick_result.direction}\n"
-        context += f"- **Confidence:** {wick_result.confidence:.0f}%\n"
-        context += f"- **Wick Ratio:** {wick_result.wick_ratio:.1f}x\n"
-        
-        if wick_result.confidence >= 85:
-            context += f"\n**HIGH PROBABILITY REVERSAL SIGNAL**\n"
-            context += f"   Strongly favor {wick_result.direction} direction.\n"
+    # Wick detection - wrap in try/except for safety
+    try:
+        if wick_result and hasattr(wick_result, 'detected') and wick_result.detected:
+            context += "\n## WICK SIGNAL DETECTED\n\n"
+            context += f"- **Type:** {wick_result.wick_type.value if hasattr(wick_result.wick_type, 'value') else wick_result.wick_type}\n"
+            context += f"- **Direction:** {wick_result.direction}\n"
+            context += f"- **Confidence:** {wick_result.confidence:.0f}%\n"
+            context += f"- **Wick Ratio:** {wick_result.wick_ratio:.1f}x\n"
+            
+            if wick_result.confidence >= 85:
+                context += f"\n**HIGH PROBABILITY REVERSAL SIGNAL**\n"
+                context += f"   Strongly favor {wick_result.direction} direction.\n"
+    except Exception:
+        pass  # Skip wick data if any error
     
     # Stop hunt & fake breakout
     if stop_hunt_result:
