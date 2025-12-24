@@ -755,6 +755,10 @@ async def signal_callback(context):
     global last_signal_time, open_trades, protected_trades, data_cache
 
     cycle_start = time.time()
+    
+    # v27.12.11: Print for immediate Render visibility
+    print(f"[SIGNAL] Cycle starting at {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC", flush=True)
+    
     logging.info("=" * 70)
     logging.info(f"=== SIGNAL CYCLE START v{BOT_VERSION} ===")
     logging.info(f"BTC Trend: {btc_trend_global} | Time: {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC")
@@ -1630,6 +1634,10 @@ async def deferred_init(context: ContextTypes.DEFAULT_TYPE):
 
     await send_welcome_once()
     logging.info("Deferred initialization complete")
+    
+    # v27.12.11: Explicit print for Render visibility
+    print(f"[INIT] Bot fully initialized. CHECK_INTERVAL={CHECK_INTERVAL}s ({CHECK_INTERVAL//60}min)", flush=True)
+    print(f"[INIT] First signal cycle in 30 seconds...", flush=True)
 
 
 async def post_init(application: Application) -> None:
@@ -1708,7 +1716,15 @@ def main():
     """Main entry point."""
     global stats
 
+    # v27.12.11: Force unbuffered output for Render
+    import sys
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+
     setup_logging()
+    
+    # v27.12.11: Immediate startup confirmation
+    print(f"[STARTUP] Grok Elite Bot v{BOT_VERSION} initializing...", flush=True)
 
     try:
         validate_config()
@@ -1717,6 +1733,7 @@ def main():
         sys.exit(1)
 
     logging.info(f"{get_emoji('rocket')} Starting Grok Elite Bot v{BOT_VERSION}")
+    print(f"[STARTUP] Configuration validated", flush=True)
 
     try:
         from bot import print_version_banner
