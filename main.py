@@ -16,6 +16,7 @@ v27.12.10 UPDATES:
 2. MANIPULATION_AVAILABLE flag for runtime checks
 3. Verified config imports include MANIPULATION_DETECTION_ENABLED
 4. All v27.12.9 fixes preserved
+"""
 import asyncio
 import sys
 import os
@@ -594,21 +595,23 @@ async def process_signal_auto_trade(trade_data: Dict, symbol: str):
 async def send_auto_trade_notification(trade_result: Dict):
     """Send Telegram notification for auto-executed trade."""
     try:
-        message = f"""
-{get_emoji('target')} **AUTO-TRADE EXECUTED**
-
-{get_emoji('chart')} **{trade_result['symbol']}** {trade_result['direction']}
-├─ Order ID: `{trade_result['order_id']}`
-├─ Size: {trade_result['size']} contracts
-├─ Entry: ${trade_result['entry']}
-├─ Stop Loss: ${trade_result['sl']}
-├─ Take Profit: ${trade_result['tp1']}
-├─ Leverage: {trade_result['leverage']}x
-├─ Grade: {trade_result['grade']}
-└─ Confidence: {trade_result['confidence']}%
-
-{get_emoji('check')} Executed at {trade_result['timestamp'][:19]}
-"""
+        entry_str = f"${trade_result['entry']}"
+        sl_str = f"${trade_result['sl']}"
+        tp_str = f"${trade_result['tp1']}"
+        
+        message = (
+            f"{get_emoji('target')} **AUTO-TRADE EXECUTED**\n\n"
+            f"{get_emoji('chart')} **{trade_result['symbol']}** {trade_result['direction']}\n"
+            f"{get_emoji('bullet')} Order ID: `{trade_result['order_id']}`\n"
+            f"{get_emoji('bullet')} Size: {trade_result['size']} contracts\n"
+            f"{get_emoji('bullet')} Entry: {entry_str}\n"
+            f"{get_emoji('bullet')} Stop Loss: {sl_str}\n"
+            f"{get_emoji('bullet')} Take Profit: {tp_str}\n"
+            f"{get_emoji('bullet')} Leverage: {trade_result['leverage']}x\n"
+            f"{get_emoji('bullet')} Grade: {trade_result['grade']}\n"
+            f"{get_emoji('bullet')} Confidence: {trade_result['confidence']}%\n\n"
+            f"{get_emoji('check')} Executed at {trade_result['timestamp'][:19]}"
+        )
         await send_throttled(CHAT_ID, message, parse_mode='Markdown')
     except Exception as e:
         logging.error(f"Failed to send auto-trade notification: {e}")
@@ -649,33 +652,35 @@ async def blofin_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for pos in positions:
             if float(pos.get('positions', 0)) != 0:
                 pnl = pos.get('unrealizedPnl', '0')
-                pos_text += f"\n├─ {pos['instId']}: {pos['positions']} @ ${pos['markPrice']} (PnL: ${pnl})"
+                mark_price = pos['markPrice']
+                pos_text += f"\n{get_emoji('bullet')} {pos['instId']}: {pos['positions']} @ {mark_price} (PnL: {pnl})"
         
         if not pos_text:
-            pos_text = "\n└─ No open positions"
+            pos_text = "\n" + get_emoji('bullet') + " No open positions"
         
         mode = "DEMO" if blofin_trader.config.demo_mode else "LIVE"
         status_emoji = get_emoji('check') if blofin_trader.config.auto_trade_enabled else get_emoji('cross')
+        auto_status = 'ON' if blofin_trader.config.auto_trade_enabled else 'OFF'
         
-        message = f"""
-{get_emoji('graph')} **BLOFIN AUTO-TRADING STATUS**
-
-{get_emoji('money')} **Account**
-├─ Equity: ${float(equity):,.2f}
-├─ Available: ${float(available):,.2f}
-└─ Mode: {mode}
-
-{get_emoji('chart')} **Positions** {pos_text}
-
-{get_emoji('gear')} **Settings**
-├─ Auto-Trade: {status_emoji} {'ON' if blofin_trader.config.auto_trade_enabled else 'OFF'}
-├─ Risk/Trade: {blofin_trader.config.risk_per_trade*100:.1f}%
-├─ Leverage: {blofin_trader.config.default_leverage}x
-├─ Min Grade: {AUTO_TRADE_MIN_GRADE}
-└─ Margin: {blofin_trader.config.margin_mode}
-
-{get_emoji('bullet')} Executed trades: {len(blofin_trader.executed_trades)}
-"""
+        equity_str = f"${float(equity):,.2f}"
+        available_str = f"${float(available):,.2f}"
+        risk_str = f"{blofin_trader.config.risk_per_trade*100:.1f}%"
+        
+        message = (
+            f"{get_emoji('graph')} **BLOFIN AUTO-TRADING STATUS**\n\n"
+            f"{get_emoji('money')} **Account**\n"
+            f"{get_emoji('bullet')} Equity: {equity_str}\n"
+            f"{get_emoji('bullet')} Available: {available_str}\n"
+            f"{get_emoji('bullet')} Mode: {mode}\n\n"
+            f"{get_emoji('chart')} **Positions** {pos_text}\n\n"
+            f"{get_emoji('gear')} **Settings**\n"
+            f"{get_emoji('bullet')} Auto-Trade: {status_emoji} {auto_status}\n"
+            f"{get_emoji('bullet')} Risk/Trade: {risk_str}\n"
+            f"{get_emoji('bullet')} Leverage: {blofin_trader.config.default_leverage}x\n"
+            f"{get_emoji('bullet')} Min Grade: {AUTO_TRADE_MIN_GRADE}\n"
+            f"{get_emoji('bullet')} Margin: {blofin_trader.config.margin_mode}\n\n"
+            f"{get_emoji('bullet')} Executed trades: {len(blofin_trader.executed_trades)}"
+        )
         await update.message.reply_text(message, parse_mode='Markdown')
         
     except Exception as e:
