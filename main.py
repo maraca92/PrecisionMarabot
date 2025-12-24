@@ -1,30 +1,21 @@
-# main.py - Grok Elite Signal Bot v27.12.10 - Main Orchestration
+# main.py - Grok Elite Signal Bot v27.12.11 - Main Orchestration
 # -*- coding: utf-8 -*-
 """
 Main entry point - Claude-only signal generation with full module integration.
+
+v27.12.11 UPDATES:
+1. NEW: Blofin Auto-Trading Integration
+2. NEW: execute_trade_signal() called on valid signals
+3. NEW: /blofin, /blofin_toggle, /blofin_close Telegram commands
+4. NEW: Blofin status in welcome message
+5. NEW: initialize_blofin() in deferred_init
+6. All v27.12.10 features preserved
 
 v27.12.10 UPDATES:
 1. Added manipulation detector imports with proper try/except
 2. MANIPULATION_AVAILABLE flag for runtime checks
 3. Verified config imports include MANIPULATION_DETECTION_ENABLED
 4. All v27.12.9 fixes preserved
-
-v27.12.9: Use this ORIGINAL WORKING version from v27.12.1
-- Fixed config STRUCTURAL_EXPECTED_WIN_RATE to 65.0 (was 0.55)
-- Fixed config STRUCTURAL_EXPECTED_AVG_BOUNCE to 3.5 (was 2.0)
-- NO changes to main.py - this is the working version
-
-v27.12.1 CHANGES:
-1. BULLETPROOF CancelledError handling around query_claude_analysis
-2. Ensures claude_result is ALWAYS a dict before calling .get()
-3. try/except wrapper around Claude call to catch any exception
-
-v27.11.0 CHANGES:
-1. Wick detection integration (euphoria/capitulation)
-2. Stop hunt and fake breakout in Claude context
-3. Fixed emoji encoding (uses Unicode escapes)
-4. Optimized and cleaned up code structure
-"""
 import asyncio
 import sys
 import os
@@ -90,6 +81,18 @@ from bot.config import (
     MIN_CONFLUENCE_LIVE, MIN_CONFLUENCE_ROADMAP, EXECUTABLE_GRADES,
     MANIPULATION_DETECTION_ENABLED  # v27.12.10: Added
 )
+
+# v27.12.11: Blofin config imports
+try:
+    from bot.config import (
+        AUTO_TRADE_ENABLED, AUTO_TRADE_MIN_GRADE,
+        is_blofin_configured, get_blofin_config_summary
+    )
+except ImportError:
+    AUTO_TRADE_ENABLED = False
+    AUTO_TRADE_MIN_GRADE = "B"
+    def is_blofin_configured(): return False
+    def get_blofin_config_summary(): return "Blofin: Not configured"
 
 # Safe config imports with fallbacks
 try:
@@ -321,6 +324,31 @@ except ImportError:
     logging.warning("Manipulation detector not available")
 
 # ============================================================================
+# v27.12.11: BLOFIN AUTO-TRADING IMPORTS
+# ============================================================================
+try:
+    from bot.blofin_trader import (
+        BlofinAutoTrader,
+        execute_trade_signal,
+        get_auto_trader,
+        BlofinClient
+    )
+    BLOFIN_AVAILABLE = True
+    logging.info("Blofin auto-trading module loaded successfully")
+except ImportError:
+    BLOFIN_AVAILABLE = False
+    logging.warning("Blofin auto-trading module not available")
+    
+    # Fallback implementations
+    async def execute_trade_signal(signal): return None
+    async def get_auto_trader(): return None
+    class BlofinAutoTrader:
+        pass
+
+# Global Blofin trader instance
+blofin_trader: Optional[BlofinAutoTrader] = None
+
+# ============================================================================
 # GLOBAL STATE
 # ============================================================================
 stats = load_stats()
@@ -480,7 +508,228 @@ async def fetch_cross_exchange_data_fast(symbol: str) -> Dict:
 
 
 # ============================================================================
-# SIGNAL CALLBACK - v27.12.1 WITH BULLETPROOF CLAUDE HANDLING
+# v27.12.11: BLOFIN AUTO-TRADING FUNCTIONS
+# ============================================================================
+
+async def initialize_blofin():
+    """Initialize Blofin auto-trading if configured."""
+    global blofin_trader
+    
+    if not BLOFIN_AVAILABLE:
+        logging.info("Blofin module not available")
+        return False
+    
+    try:
+        if not is_blofin_configured():
+            logging.info("Blofin API not configured - auto-trading disabled")
+            return False
+        
+        if not AUTO_TRADE_ENABLED:
+            logging.info("Auto-trading is disabled in config")
+            return False
+        
+        blofin_trader = await get_auto_trader()
+        if blofin_trader and blofin_trader.config.auto_trade_enabled:
+            logging.info(f"{get_emoji('target')} Blofin Auto-Trader initialized successfully")
+            return True
+        return False
+        
+    except Exception as e:
+        logging.error(f"Failed to initialize Blofin: {e}")
+        return False
+
+
+async def process_signal_auto_trade(trade_data: Dict, symbol: str):
+    """
+    Process a generated signal and execute via Blofin if enabled.
+    
+    Args:
+        trade_data: The trade dictionary from signal generation
+        symbol: Trading pair (e.g., "BTC/USDT")
+    """
+    global blofin_trader
+    
+    if not blofin_trader or not AUTO_TRADE_ENABLED:
+        return
+    
+    grade = trade_data.get('grade', 'C')
+    
+    # Check grade threshold
+    valid_grades = {"A": 3, "B": 2, "C": 1, "D": 0}
+    if valid_grades.get(grade, 0) < valid_grades.get(AUTO_TRADE_MIN_GRADE, 2):
+        logging.debug(f"Signal grade {grade} below minimum {AUTO_TRADE_MIN_GRADE} - skipping auto-trade")
+        return
+    
+    try:
+        # Build signal for Blofin execution
+        trade_signal = {
+            "symbol": symbol,
+            "direction": trade_data.get('direction', '').upper(),
+            "entry": trade_data.get('entry_price') or ((trade_data.get('entry_low', 0) + trade_data.get('entry_high', 0)) / 2),
+            "sl": trade_data.get('sl'),
+            "tp1": trade_data.get('tp1'),
+            "tp2": trade_data.get('tp2'),
+            "confidence": trade_data.get('confidence', 0),
+            "grade": grade
+        }
+        
+        # Validate required fields
+        if not all([trade_signal['direction'], trade_signal['entry'], 
+                    trade_signal['sl'], trade_signal['tp1']]):
+            logging.warning(f"Signal missing required fields for auto-trade: {trade_signal}")
+            return
+        
+        execution_result = await execute_trade_signal(trade_signal)
+        
+        if execution_result:
+            logging.info(f"{get_emoji('target')} Auto-trade executed: {execution_result.get('order_id')}")
+            await send_auto_trade_notification(execution_result)
+        
+    except Exception as e:
+        logging.error(f"Auto-trade execution failed: {e}")
+        import traceback
+        logging.error(traceback.format_exc())
+
+
+async def send_auto_trade_notification(trade_result: Dict):
+    """Send Telegram notification for auto-executed trade."""
+    try:
+        message = f"""
+{get_emoji('target')} **AUTO-TRADE EXECUTED**
+
+{get_emoji('chart')} **{trade_result['symbol']}** {trade_result['direction']}
+├─ Order ID: `{trade_result['order_id']}`
+├─ Size: {trade_result['size']} contracts
+├─ Entry: ${trade_result['entry']}
+├─ Stop Loss: ${trade_result['sl']}
+├─ Take Profit: ${trade_result['tp1']}
+├─ Leverage: {trade_result['leverage']}x
+├─ Grade: {trade_result['grade']}
+└─ Confidence: {trade_result['confidence']}%
+
+{get_emoji('check')} Executed at {trade_result['timestamp'][:19]}
+"""
+        await send_throttled(CHAT_ID, message, parse_mode='Markdown')
+    except Exception as e:
+        logging.error(f"Failed to send auto-trade notification: {e}")
+
+
+# ============================================================================
+# v27.12.11: BLOFIN TELEGRAM COMMANDS
+# ============================================================================
+
+async def blofin_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check Blofin auto-trading status - /blofin command"""
+    global blofin_trader
+    
+    if str(update.effective_user.id) != CHAT_ID:
+        await update.message.reply_text(f"{get_emoji('cross')} Unauthorized")
+        return
+    
+    if not BLOFIN_AVAILABLE or not blofin_trader:
+        await update.message.reply_text(
+            f"{get_emoji('cross')} Blofin Auto-Trading not configured\n\n"
+            "Set these environment variables:\n"
+            "• BLOFIN_API_KEY\n"
+            "• BLOFIN_SECRET_KEY\n"
+            "• BLOFIN_PASSPHRASE\n"
+            "• AUTO_TRADE_ENABLED=true"
+        )
+        return
+    
+    try:
+        balance = await blofin_trader.client.get_balance()
+        positions = await blofin_trader.check_positions()
+        
+        equity = balance.get('totalEquity', '0')
+        details = balance.get('details', [{}])
+        available = details[0].get('available', '0') if details else '0'
+        
+        pos_text = ""
+        for pos in positions:
+            if float(pos.get('positions', 0)) != 0:
+                pnl = pos.get('unrealizedPnl', '0')
+                pos_text += f"\n├─ {pos['instId']}: {pos['positions']} @ ${pos['markPrice']} (PnL: ${pnl})"
+        
+        if not pos_text:
+            pos_text = "\n└─ No open positions"
+        
+        mode = "DEMO" if blofin_trader.config.demo_mode else "LIVE"
+        status_emoji = get_emoji('check') if blofin_trader.config.auto_trade_enabled else get_emoji('cross')
+        
+        message = f"""
+{get_emoji('graph')} **BLOFIN AUTO-TRADING STATUS**
+
+{get_emoji('money')} **Account**
+├─ Equity: ${float(equity):,.2f}
+├─ Available: ${float(available):,.2f}
+└─ Mode: {mode}
+
+{get_emoji('chart')} **Positions** {pos_text}
+
+{get_emoji('gear')} **Settings**
+├─ Auto-Trade: {status_emoji} {'ON' if blofin_trader.config.auto_trade_enabled else 'OFF'}
+├─ Risk/Trade: {blofin_trader.config.risk_per_trade*100:.1f}%
+├─ Leverage: {blofin_trader.config.default_leverage}x
+├─ Min Grade: {AUTO_TRADE_MIN_GRADE}
+└─ Margin: {blofin_trader.config.margin_mode}
+
+{get_emoji('bullet')} Executed trades: {len(blofin_trader.executed_trades)}
+"""
+        await update.message.reply_text(message, parse_mode='Markdown')
+        
+    except Exception as e:
+        await update.message.reply_text(f"{get_emoji('cross')} Error: {e}")
+
+
+async def blofin_toggle_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle auto-trading on/off - /blofin_toggle command"""
+    global blofin_trader
+    
+    if str(update.effective_user.id) != CHAT_ID:
+        await update.message.reply_text(f"{get_emoji('cross')} Unauthorized")
+        return
+    
+    if not BLOFIN_AVAILABLE or not blofin_trader:
+        await update.message.reply_text(f"{get_emoji('cross')} Blofin not configured")
+        return
+    
+    blofin_trader.config.auto_trade_enabled = not blofin_trader.config.auto_trade_enabled
+    status = f"{get_emoji('check')} ENABLED" if blofin_trader.config.auto_trade_enabled else f"{get_emoji('cross')} DISABLED"
+    await update.message.reply_text(f"{get_emoji('target')} Auto-Trading: {status}")
+
+
+async def blofin_close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Close all Blofin positions - /blofin_close command"""
+    global blofin_trader
+    
+    if str(update.effective_user.id) != CHAT_ID:
+        await update.message.reply_text(f"{get_emoji('cross')} Unauthorized")
+        return
+    
+    if not BLOFIN_AVAILABLE or not blofin_trader:
+        await update.message.reply_text(f"{get_emoji('cross')} Blofin not configured")
+        return
+    
+    try:
+        await update.message.reply_text(f"{get_emoji('warning')} Closing all positions...")
+        results = await blofin_trader.close_all_positions()
+        
+        if not results:
+            await update.message.reply_text(f"{get_emoji('check')} No positions to close")
+        else:
+            success = sum(1 for v in results.values() if v)
+            failed = len(results) - success
+            await update.message.reply_text(
+                f"{get_emoji('check')} Closed {success} positions\n"
+                f"{get_emoji('cross')} Failed: {failed} positions"
+            )
+    except Exception as e:
+        await update.message.reply_text(f"{get_emoji('cross')} Error: {e}")
+
+
+# ============================================================================
+# SIGNAL CALLBACK - v27.12.11 WITH AUTO-TRADING
 # ============================================================================
 async def signal_callback(context):
     """Main signal generation loop with unified evaluator and wick detection."""
@@ -894,6 +1143,10 @@ async def signal_callback(context):
                 await save_trades_async(open_trades)
                 last_signal_time[symbol] = now
 
+                # v27.12.11: Execute auto-trade if enabled
+                if blofin_trader and AUTO_TRADE_ENABLED:
+                    await process_signal_auto_trade(open_trades[symbol], symbol)
+
                 rr1 = tp1_dist / sl_dist if sl_dist > 0 else 0
                 rr2 = abs(grok['tp2'] - entry_mid) / sl_dist if sl_dist > 0 else 0
 
@@ -1257,6 +1510,12 @@ async def send_welcome_once():
         evaluator_status = f"{get_emoji('check')} Unified" if UNIFIED_EVALUATOR_AVAILABLE else f"{get_emoji('warning')} Legacy"
         recap_status = f"{get_emoji('check')} Fixed" if FIXED_RECAP_AVAILABLE else f"{get_emoji('warning')} Legacy"
         wick_status = f"{get_emoji('check')}" if WICK_DETECTOR_AVAILABLE else f"{get_emoji('cross')}"
+        
+        # v27.12.11: Blofin status
+        if is_blofin_configured():
+            blofin_status = f"{get_emoji('check')} {'ON' if AUTO_TRADE_ENABLED else 'OFF'}"
+        else:
+            blofin_status = f"{get_emoji('cross')} Not configured"
 
         mode_emoji = get_emoji('paper') if PAPER_TRADING else get_emoji('money')
 
@@ -1266,14 +1525,15 @@ async def send_welcome_once():
             f"**AI:** Claude (Primary) + Grok (Opinion)\n"
             f"**Symbols:** {len(SYMBOLS)}\n"
             f"**Capital:** ${SIMULATED_CAPITAL:,.0f}\n\n"
-            f"**v27.12.1 Features:**\n"
-            f"{get_emoji('bullet')} Bulletproof CancelledError handling\n"
+            f"**v27.12.11 Features:**\n"
+            f"{get_emoji('bullet')} Blofin Auto-Trading Integration\n"
             f"{get_emoji('bullet')} Wick detection (euphoria/capitulation)\n"
             f"{get_emoji('bullet')} Stop hunt & fake breakout context\n"
-            f"{get_emoji('bullet')} Fixed emoji encoding\n\n"
+            f"{get_emoji('bullet')} Manipulation detection\n\n"
             f"**Signal Evaluator:** {evaluator_status}\n"
             f"**Daily Recap:** {recap_status}\n"
             f"**Wick Detection:** {wick_status}\n"
+            f"**Blofin Auto-Trade:** {blofin_status}\n"
             f"**Grok Opinion:** {get_emoji('check') if GROK_OPINION_ENABLED else get_emoji('cross')}\n"
             f"**Structure Detection:** {get_emoji('check') if STRUCTURE_DETECTION_ENABLED else get_emoji('cross')}\n"
             f"**Psychology Analysis:** {get_emoji('check') if PSYCHOLOGY_ENABLED else get_emoji('cross')}\n\n"
@@ -1296,7 +1556,7 @@ async def send_welcome_once():
 
 async def deferred_init(context: ContextTypes.DEFAULT_TYPE):
     """Run slow initialization tasks AFTER webhook is up."""
-    global btc_trend_global
+    global btc_trend_global, blofin_trader
 
     logging.info("Running deferred initialization...")
 
@@ -1331,6 +1591,13 @@ async def deferred_init(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"Health check error: {e}")
 
+    # v27.12.11: Initialize Blofin Auto-Trading
+    try:
+        blofin_ok = await initialize_blofin()
+        logging.info(f"Blofin Auto-Trade: {'OK' if blofin_ok else 'DISABLED'}")
+    except Exception as e:
+        logging.error(f"Blofin init error: {e}")
+
     await send_welcome_once()
     logging.info("Deferred initialization complete")
 
@@ -1362,9 +1629,18 @@ async def post_init(application: Application) -> None:
 
 async def shutdown_handler(application: Application) -> None:
     """Properly shutdown all async tasks and connections."""
-    global background_task
+    global background_task, blofin_trader
 
     logging.info(f"{get_emoji('wave')} Starting graceful shutdown...")
+
+    # v27.12.11: Close Blofin connection
+    if blofin_trader:
+        logging.info("  Closing Blofin connection...")
+        try:
+            await blofin_trader.close()
+            logging.info(f"  {get_emoji('check')} Blofin closed")
+        except Exception as e:
+            logging.warning(f"  {get_emoji('warning')} Blofin close error: {e}")
 
     logging.info("  Closing exchange connections...")
     try:
@@ -1421,6 +1697,8 @@ def main():
     logging.info(f"Unified SignalEvaluator: {'ENABLED' if UNIFIED_EVALUATOR_AVAILABLE else 'DISABLED'}")
     logging.info(f"Fixed Daily Recap: {'ENABLED' if FIXED_RECAP_AVAILABLE else 'DISABLED'}")
     logging.info(f"Wick Detection: {'ENABLED' if WICK_DETECTOR_AVAILABLE else 'DISABLED'}")
+    logging.info(f"Blofin Module: {'AVAILABLE' if BLOFIN_AVAILABLE else 'NOT AVAILABLE'}")
+    logging.info(f"Auto-Trade Enabled: {AUTO_TRADE_ENABLED}")
 
     stats = load_stats()
 
@@ -1445,6 +1723,11 @@ def main():
     application.add_handler(CommandHandler("structural", structural_cmd))
     application.add_handler(CommandHandler("genroadmap", genroadmap_cmd))
     application.add_handler(CommandHandler("commands", commands_cmd))
+    
+    # v27.12.11: Blofin auto-trading commands
+    application.add_handler(CommandHandler("blofin", blofin_status_cmd))
+    application.add_handler(CommandHandler("blofin_toggle", blofin_toggle_cmd))
+    application.add_handler(CommandHandler("blofin_close", blofin_close_cmd))
 
     application.add_handler(MessageHandler(filters.ALL, dummy_handler))
 
