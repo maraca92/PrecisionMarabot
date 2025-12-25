@@ -1,6 +1,16 @@
-# roadmap.py - Grok Elite Signal Bot v27.12.11 - Dual Roadmap System
+# roadmap.py - Grok Elite Signal Bot v27.12.13 - Dual Roadmap System
 # -*- coding: utf-8 -*-
 """
+v27.12.13: CRITICAL FIX - DIRECTION LOGIC & WHY SECTION
+
+CHANGES:
+1. FIXED: Direction logic was INVERTED for short trades!
+   - For LONG: price should be ABOVE zone (waiting to drop to it)
+   - For SHORT: price should be BELOW zone (waiting to rise to it)
+   - Previously SHORT logic was backwards
+2. FIXED: Why section now shows actual confluence data instead of generic text
+3. Added HTF trend and regime info to Why section
+
 v27.12.11: CRITICAL FIX - ROADMAP TO LIVE TRADE CONVERSION
 
 CHANGES:
@@ -357,12 +367,39 @@ async def send_roadmap_batch(zones: List[Dict], zone_type: str, prices: Dict, bt
         ob_strength = zone.get('ob_strength', zone.get('strength', 1.5))
         ob_label = f"OB {ob_strength:.1f}"
         
-        # Build why text
+        # v27.12.13: Build detailed why text from actual confluence data
         why_parts = []
-        why_parts.append(f"Strong {zone['direction'].lower()} zone")
+        
+        # Add confluence from zone if available
+        confluence = zone.get('confluence', '')
+        if confluence:
+            why_parts.append(confluence)
+        else:
+            why_parts.append(f"Strong {zone['direction'].lower()} zone")
+        
+        # Add distance info
         why_parts.append(f"{dist_pct:.1f}% from current price")
-        why_parts.append("Trending market - momentum favors continuation")
-        why_text = " | ".join(why_parts) + "..."
+        
+        # Add HTF trend context
+        htf_trend = zone.get('htf_trend', '')
+        if htf_trend:
+            if htf_trend.lower() == 'bullish' and zone['direction'] == 'Long':
+                why_parts.append("HTF trend aligned (bullish)")
+            elif htf_trend.lower() == 'bearish' and zone['direction'] == 'Short':
+                why_parts.append("HTF trend aligned (bearish)")
+            else:
+                why_parts.append(f"HTF: {htf_trend}")
+        
+        # Add regime context
+        regime = zone.get('regime', '')
+        if regime:
+            why_parts.append(f"Market: {regime}")
+        
+        # Add timeframe
+        tf = zone.get('timeframe', '4h')
+        why_parts.append(f"Source: {tf.upper()}")
+        
+        why_text = " | ".join(why_parts)
         
         # v27.12.3: Get Grok opinion for this zone
         grok_display = zone.get('grok_display', '')
@@ -456,16 +493,32 @@ async def generate_trend_roadmap_zones(
                 rejected['strength'] += 1
                 continue
             
-            # Determine direction based on OB type and HTF trend
+            # Determine direction based on OB type and position relative to price
+            # v27.12.13: CRITICAL FIX - Direction logic was inverted for shorts!
+            #
+            # For LONG trades (bullish OB):
+            #   - Price should be ABOVE the zone (price has dropped to the zone)
+            #   - We wait for price to touch the zone from above and bounce up
+            #   - So: price > ob_mid means we're positioned correctly to go long
+            #
+            # For SHORT trades (bearish OB):
+            #   - Price should be BELOW the zone (price will rise to the zone)
+            #   - We wait for price to touch the zone from below and reject down
+            #   - So: price < ob_mid means we're positioned correctly to go short
+            #
             is_bullish_ob = ob.get('type', '').lower() == 'bullish' or 'bullish' in str(ob).lower()
             
             if is_bullish_ob:
-                if price > ob_mid:
+                # Bullish OB = support zone = go LONG when price drops to it
+                if price < ob_mid:
+                    # Price already below the zone - we missed the entry
                     rejected['position'] += 1
                     continue
                 direction = 'Long'
             else:
-                if price < ob_mid:
+                # Bearish OB = resistance zone = go SHORT when price rises to it
+                if price > ob_mid:
+                    # Price already above the zone - we missed the entry
                     rejected['position'] += 1
                     continue
                 direction = 'Short'
