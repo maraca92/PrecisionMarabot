@@ -256,6 +256,164 @@ def clear_expired_roadmap_zones(zones: Dict[str, List[Dict]], max_age_hours: int
     
     return cleaned
 
+
+# ============================================================================
+# v27.12.13: SIGNAL PERFORMANCE TRACKING
+# ============================================================================
+
+# Try to import factor performance file path
+try:
+    from bot.config import FACTOR_PERFORMANCE_FILE
+except ImportError:
+    FACTOR_PERFORMANCE_FILE = 'data/factor_performance.json'
+
+
+class SignalTracker:
+    """
+    Track which confluence factors produce winning trades.
+    
+    Records signal outcomes and calculates win rate by factor
+    to enable data-driven strategy improvements.
+    """
+    
+    def __init__(self):
+        self.performance_data = self._load_performance()
+    
+    def _load_performance(self) -> Dict:
+        """Load factor performance data from disk."""
+        if os.path.exists(FACTOR_PERFORMANCE_FILE):
+            try:
+                with open(FACTOR_PERFORMANCE_FILE, 'r') as f:
+                    return json.load(f)
+            except Exception as e:
+                logging.warning(f"Failed to load factor performance: {e}")
+        
+        return {
+            'factors': {},
+            'total_signals': 0,
+            'total_wins': 0,
+            'total_losses': 0,
+            'last_updated': None
+        }
+    
+    async def save_performance(self):
+        """Save factor performance data to disk."""
+        try:
+            self.performance_data['last_updated'] = datetime.now(timezone.utc).isoformat()
+            
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(FACTOR_PERFORMANCE_FILE), exist_ok=True)
+            
+            async with aiofiles.open(FACTOR_PERFORMANCE_FILE, 'w') as f:
+                await f.write(json.dumps(self.performance_data, indent=2))
+        except Exception as e:
+            logging.error(f"Failed to save factor performance: {e}")
+    
+    def record_signal(self, factors: List[str], outcome: str, pnl: float = 0):
+        """
+        Record a signal outcome for performance tracking.
+        
+        Args:
+            factors: List of confluence factors present in the signal
+            outcome: 'TP1', 'TP2', 'SL', 'TIMEOUT', 'BREAKEVEN'
+            pnl: Profit/loss in percentage
+        """
+        is_win = outcome in ['TP1', 'TP2', 'BREAKEVEN']
+        is_loss = outcome == 'SL'
+        
+        self.performance_data['total_signals'] += 1
+        
+        if is_win:
+            self.performance_data['total_wins'] += 1
+        elif is_loss:
+            self.performance_data['total_losses'] += 1
+        
+        # Update each factor's statistics
+        for factor in factors:
+            if factor not in self.performance_data['factors']:
+                self.performance_data['factors'][factor] = {
+                    'signals': 0,
+                    'wins': 0,
+                    'losses': 0,
+                    'tp1_hits': 0,
+                    'tp2_hits': 0,
+                    'total_pnl': 0,
+                    'win_rate': 0
+                }
+            
+            f_data = self.performance_data['factors'][factor]
+            f_data['signals'] += 1
+            f_data['total_pnl'] += pnl
+            
+            if outcome == 'TP1':
+                f_data['wins'] += 1
+                f_data['tp1_hits'] += 1
+            elif outcome == 'TP2':
+                f_data['wins'] += 1
+                f_data['tp2_hits'] += 1
+            elif outcome == 'BREAKEVEN':
+                f_data['wins'] += 1
+            elif is_loss:
+                f_data['losses'] += 1
+            
+            # Calculate win rate
+            if f_data['signals'] > 0:
+                f_data['win_rate'] = f_data['wins'] / f_data['signals'] * 100
+    
+    def get_factor_rankings(self, min_signals: int = 5) -> List[Dict]:
+        """
+        Get factors ranked by win rate.
+        
+        Args:
+            min_signals: Minimum signals required for ranking
+        
+        Returns:
+            List of factors sorted by win rate
+        """
+        rankings = []
+        
+        for factor, data in self.performance_data['factors'].items():
+            if data['signals'] >= min_signals:
+                rankings.append({
+                    'factor': factor,
+                    'signals': data['signals'],
+                    'wins': data['wins'],
+                    'losses': data['losses'],
+                    'win_rate': data['win_rate'],
+                    'avg_pnl': data['total_pnl'] / data['signals'] if data['signals'] > 0 else 0,
+                    'tp2_rate': data['tp2_hits'] / data['signals'] * 100 if data['signals'] > 0 else 0
+                })
+        
+        return sorted(rankings, key=lambda x: x['win_rate'], reverse=True)
+    
+    def get_overall_stats(self) -> Dict:
+        """Get overall performance statistics."""
+        total = self.performance_data['total_signals']
+        wins = self.performance_data['total_wins']
+        losses = self.performance_data['total_losses']
+        
+        return {
+            'total_signals': total,
+            'wins': wins,
+            'losses': losses,
+            'win_rate': wins / total * 100 if total > 0 else 0,
+            'factors_tracked': len(self.performance_data['factors']),
+            'last_updated': self.performance_data.get('last_updated')
+        }
+
+
+# Global signal tracker instance
+_signal_tracker: SignalTracker = None
+
+
+def get_signal_tracker() -> SignalTracker:
+    """Get or create the signal tracker singleton."""
+    global _signal_tracker
+    if _signal_tracker is None:
+        _signal_tracker = SignalTracker()
+    return _signal_tracker
+
+
 # ============================================================================
 # HISTORICAL DATA
 # ============================================================================
