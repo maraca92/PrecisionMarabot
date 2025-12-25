@@ -322,6 +322,59 @@ MIN_RR_RATIO = 1.5
 IDEAL_RR_RATIO = 2.0
 TRAILING_STOP_PCT = 0.5
 
+# v27.12.13: Dynamic TP based on volatility regime
+DYNAMIC_TP_ENABLED = os.getenv("DYNAMIC_TP_ENABLED", "true").lower() == "true"
+
+# TP multipliers by volatility regime (in R-multiples)
+DYNAMIC_TP_HIGH_VOL = {
+    'tp1_r': 2.0,    # 2R for TP1 in high volatility
+    'tp2_r': 4.0,    # 4R for TP2 in high volatility
+}
+
+DYNAMIC_TP_MEDIUM_VOL = {
+    'tp1_r': 1.75,   # 1.75R for TP1 in medium volatility
+    'tp2_r': 3.0,    # 3R for TP2 in medium volatility
+}
+
+DYNAMIC_TP_LOW_VOL = {
+    'tp1_r': 1.5,    # 1.5R for TP1 in low volatility
+    'tp2_r': 2.5,    # 2.5R for TP2 in low volatility
+}
+
+# ============================================================================
+# v27.12.13: MULTI-TIMEFRAME CONFLUENCE WEIGHTING
+# ============================================================================
+MTF_WEIGHTING_ENABLED = os.getenv("MTF_WEIGHTING_ENABLED", "true").lower() == "true"
+
+# Timeframe weights for confluence scoring
+MTF_WEIGHTS = {
+    '1d': 0.40,    # Daily is most important (40%)
+    '4h': 0.35,    # 4-hour is secondary (35%)
+    '1h': 0.25,    # 1-hour for entry timing (25%)
+}
+
+# Minimum MTF alignment score for signal validation
+MTF_MIN_ALIGNMENT_SCORE = 0.5  # At least 50% alignment
+
+# ============================================================================
+# v27.12.13: SIGNAL PERFORMANCE TRACKING
+# ============================================================================
+SIGNAL_TRACKING_ENABLED = os.getenv("SIGNAL_TRACKING_ENABLED", "true").lower() == "true"
+FACTOR_PERFORMANCE_FILE = os.getenv("FACTOR_PERFORMANCE_FILE", "data/factor_performance.json")
+
+# ============================================================================
+# v27.12.13: LIQUIDITY ANALYSIS
+# ============================================================================
+LIQUIDITY_ANALYSIS_ENABLED = os.getenv("LIQUIDITY_ANALYSIS_ENABLED", "true").lower() == "true"
+LIQUIDITY_MIN_CLUSTER_SIGNIFICANCE = 3.0
+
+# ============================================================================
+# v27.12.13: ORDERBOOK IMBALANCE
+# ============================================================================
+ORDERBOOK_ANALYSIS_ENABLED = os.getenv("ORDERBOOK_ANALYSIS_ENABLED", "true").lower() == "true"
+ORDERBOOK_IMBALANCE_THRESHOLD_LONG = 1.5   # Bid/ask ratio > 1.5 = bullish
+ORDERBOOK_IMBALANCE_THRESHOLD_SHORT = 0.67  # Bid/ask ratio < 0.67 = bearish
+
 # ============================================================================
 # EXCHANGE CONFIG
 # ============================================================================
