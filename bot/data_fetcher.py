@@ -577,6 +577,116 @@ async def fetch_open_interest(symbol: str) -> Optional[Dict[str, float]]:
             return None
 
 # ============================================================================
+# v27.12.13: ORDERBOOK IMBALANCE ANALYSIS
+# ============================================================================
+
+def analyze_orderbook_imbalance(orderbook: Dict, depth_levels: int = 10) -> Dict:
+    """
+    Analyze orderbook for bid/ask imbalance indicating institutional activity.
+    
+    Args:
+        orderbook: Raw orderbook data from exchange
+        depth_levels: Number of levels to analyze
+    
+    Returns:
+        Dict with imbalance metrics and signal
+    """
+    if not orderbook or 'bids' not in orderbook or 'asks' not in orderbook:
+        return {
+            'signal': 'NEUTRAL',
+            'imbalance_ratio': 1.0,
+            'bid_wall': None,
+            'ask_wall': None,
+            'confidence': 0
+        }
+    
+    bids = orderbook.get('bids', [])[:depth_levels]
+    asks = orderbook.get('asks', [])[:depth_levels]
+    
+    if not bids or not asks:
+        return {
+            'signal': 'NEUTRAL',
+            'imbalance_ratio': 1.0,
+            'bid_wall': None,
+            'ask_wall': None,
+            'confidence': 0
+        }
+    
+    # Calculate total bid and ask volume
+    total_bid_volume = sum(float(b[1]) for b in bids)
+    total_ask_volume = sum(float(a[1]) for a in asks)
+    
+    # Imbalance ratio (>1 = more bids, <1 = more asks)
+    imbalance_ratio = total_bid_volume / total_ask_volume if total_ask_volume > 0 else 1.0
+    
+    # Detect walls (single level with >25% of total volume)
+    bid_wall = None
+    ask_wall = None
+    
+    for bid in bids:
+        if float(bid[1]) > total_bid_volume * 0.25:
+            bid_wall = {'price': float(bid[0]), 'volume': float(bid[1])}
+            break
+    
+    for ask in asks:
+        if float(ask[1]) > total_ask_volume * 0.25:
+            ask_wall = {'price': float(ask[0]), 'volume': float(ask[1])}
+            break
+    
+    # Generate signal
+    confidence = 0
+    if imbalance_ratio > 1.5:
+        signal = 'LONG'
+        confidence = min(90, int(50 + (imbalance_ratio - 1) * 20))
+    elif imbalance_ratio < 0.67:
+        signal = 'SHORT'
+        confidence = min(90, int(50 + (1 / imbalance_ratio - 1) * 20))
+    else:
+        signal = 'NEUTRAL'
+        confidence = 30
+    
+    # Wall detection adjusts confidence
+    if signal == 'LONG' and bid_wall:
+        confidence += 10
+    elif signal == 'SHORT' and ask_wall:
+        confidence += 10
+    
+    # Opposing wall reduces confidence
+    if signal == 'LONG' and ask_wall and not bid_wall:
+        confidence -= 15
+    elif signal == 'SHORT' and bid_wall and not ask_wall:
+        confidence -= 15
+    
+    return {
+        'signal': signal,
+        'imbalance_ratio': round(imbalance_ratio, 2),
+        'bid_volume': total_bid_volume,
+        'ask_volume': total_ask_volume,
+        'bid_wall': bid_wall,
+        'ask_wall': ask_wall,
+        'confidence': max(0, min(100, confidence))
+    }
+
+
+async def get_orderbook_signals(order_books: Dict[str, Dict]) -> Dict[str, Dict]:
+    """
+    Get orderbook imbalance signals for all symbols.
+    
+    Args:
+        order_books: Dict of orderbooks by symbol
+    
+    Returns:
+        Dict of imbalance analysis by symbol
+    """
+    signals = {}
+    
+    for symbol, orderbook in order_books.items():
+        signals[symbol] = analyze_orderbook_imbalance(orderbook)
+    
+    return signals
+
+
+# ============================================================================
 # BACKGROUND PRICE POLLING - v27.12.12 with logging
 # ============================================================================
 async def price_background_task():
