@@ -309,6 +309,15 @@ except ImportError:
     async def structural_cmd(update, context):
         await update.message.reply_text("Structural command not available")
 
+# v27.12.13: Advanced analytics commands
+try:
+    from bot.telegram_commands import factor_analysis_cmd, system_health_cmd
+except ImportError:
+    async def factor_analysis_cmd(update, context):
+        await update.message.reply_text("Factor analysis not available")
+    async def system_health_cmd(update, context):
+        await update.message.reply_text("System health not available")
+
 # Roadmap imports
 from bot.roadmap import (
     roadmap_zones, initialize_roadmaps, roadmap_generation_callback,
@@ -1641,10 +1650,12 @@ async def send_welcome_once():
             f"**Symbols:** {len(SYMBOLS)}\n"
             f"**Capital:** ${SIMULATED_CAPITAL:,.0f}\n\n"
             f"**v27.12.13 Features:**\n"
-            f"{get_emoji('bullet')} Blofin brokerId fix (152013 error)\n"
-            f"{get_emoji('bullet')} Session-based trade timing\n"
-            f"{get_emoji('bullet')} Correlation position sizing\n"
-            f"{get_emoji('bullet')} Drawdown protection\n\n"
+            f"{get_emoji('bullet')} Dynamic TPs (volatility-based)\n"
+            f"{get_emoji('bullet')} MTF confluence weighting\n"
+            f"{get_emoji('bullet')} Liquidity heatmap analysis\n"
+            f"{get_emoji('bullet')} Orderbook imbalance detection\n"
+            f"{get_emoji('bullet')} Signal performance tracking\n"
+            f"{get_emoji('bullet')} /factor_analysis & /system_health\n\n"
             f"**Signal Evaluator:** {evaluator_status}\n"
             f"**Daily Recap:** {recap_status}\n"
             f"**Wick Detection:** {wick_status}\n"
@@ -1885,6 +1896,10 @@ def main():
     application.add_handler(CommandHandler("blofin", blofin_status_cmd))
     application.add_handler(CommandHandler("blofin_toggle", blofin_toggle_cmd))
     application.add_handler(CommandHandler("blofin_close", blofin_close_cmd))
+    
+    # v27.12.13: Advanced analytics commands
+    application.add_handler(CommandHandler("factor_analysis", factor_analysis_cmd))
+    application.add_handler(CommandHandler("system_health", system_health_cmd))
 
     application.add_handler(MessageHandler(filters.ALL, dummy_handler))
 
