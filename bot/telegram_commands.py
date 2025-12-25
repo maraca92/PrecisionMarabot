@@ -829,3 +829,160 @@ async def dashboard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"Dashboard error: {e}")
         await send_throttled(CHAT_ID, f"Error: {str(e)}", parse_mode='Markdown')
+
+
+# ============================================================================
+# v27.12.13: FACTOR ANALYSIS COMMAND
+# ============================================================================
+
+async def factor_analysis_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Show which confluence factors produce the best win rates.
+    
+    Usage: /factors
+    """
+    if str(update.effective_user.id) != CHAT_ID:
+        await update.message.reply_text("Unauthorized")
+        return
+    
+    try:
+        from bot.models import get_signal_tracker
+        
+        tracker = get_signal_tracker()
+        rankings = tracker.get_factor_rankings(min_signals=3)
+        overall = tracker.get_overall_stats()
+        
+        if not rankings:
+            await update.message.reply_text(
+                "📊 **Factor Analysis**\n\n"
+                "Not enough data yet. Need at least 3 signals per factor.\n"
+                f"Total signals tracked: {overall['total_signals']}"
+            )
+            return
+        
+        msg = "📊 **Factor Performance Analysis**\n\n"
+        msg += f"**Overall**: {overall['wins']}W / {overall['losses']}L ({overall['win_rate']:.1f}%)\n"
+        msg += f"**Factors Tracked**: {overall['factors_tracked']}\n\n"
+        msg += "**Top Performing Factors:**\n"
+        
+        for i, factor_data in enumerate(rankings[:10], 1):
+            wr = factor_data['win_rate']
+            
+            # Win rate emoji
+            if wr >= 70:
+                emoji = "🟢"
+            elif wr >= 55:
+                emoji = "🟡"
+            else:
+                emoji = "🔴"
+            
+            factor_name = factor_data['factor'][:20]  # Truncate long names
+            msg += f"{emoji} {i}. **{factor_name}**\n"
+            msg += f"    {factor_data['signals']} signals | {wr:.0f}% WR | TP2: {factor_data['tp2_rate']:.0f}%\n"
+        
+        if len(rankings) > 10:
+            msg += f"\n_...and {len(rankings) - 10} more factors_"
+        
+        msg += "\n\n💡 **Tip**: Focus on factors with >60% win rate"
+        
+        await send_throttled(CHAT_ID, msg, parse_mode='Markdown')
+        
+    except Exception as e:
+        logging.error(f"Factor analysis error: {e}")
+        await send_throttled(CHAT_ID, f"Error: {str(e)}")
+
+
+# ============================================================================
+# v27.12.13: SYSTEM HEALTH COMMAND (ENHANCED)
+# ============================================================================
+
+async def system_health_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Comprehensive system health check.
+    
+    Usage: /system_health
+    """
+    if str(update.effective_user.id) != CHAT_ID:
+        await update.message.reply_text("Unauthorized")
+        return
+    
+    try:
+        from bot.config import (
+            BLOFIN_API_KEY, AUTO_TRADE_ENABLED, BLOFIN_DEMO_MODE,
+            DYNAMIC_TP_ENABLED, MTF_WEIGHTING_ENABLED, 
+            SIGNAL_TRACKING_ENABLED, LIQUIDITY_ANALYSIS_ENABLED,
+            SESSION_TRADING_ENABLED, CORRELATION_SIZING_ENABLED
+        )
+        
+        msg = "🏥 **System Health Dashboard**\n\n"
+        
+        # === API Status ===
+        msg += "**📡 API Status:**\n"
+        
+        # Claude API
+        try:
+            from bot.claude_api import anthropic_client
+            claude_ok = anthropic_client is not None
+            msg += f"  Claude: {'✅ OK' if claude_ok else '❌ Not configured'}\n"
+        except:
+            msg += f"  Claude: ❌ Error\n"
+        
+        # Bybit API
+        try:
+            from bot.data_fetcher import exchange
+            bybit_ok = exchange is not None
+            msg += f"  Bybit: {'✅ OK' if bybit_ok else '❌ Not configured'}\n"
+        except:
+            msg += f"  Bybit: ❌ Error\n"
+        
+        # Blofin API
+        if BLOFIN_API_KEY:
+            mode = "DEMO" if BLOFIN_DEMO_MODE else "LIVE"
+            status = "ON" if AUTO_TRADE_ENABLED else "OFF"
+            msg += f"  Blofin: ✅ {mode} ({status})\n"
+        else:
+            msg += f"  Blofin: ⚪ Not configured\n"
+        
+        # === Feature Status ===
+        msg += "\n**⚙️ Features:**\n"
+        
+        features = [
+            ("Dynamic TPs", DYNAMIC_TP_ENABLED),
+            ("MTF Weighting", MTF_WEIGHTING_ENABLED),
+            ("Signal Tracking", SIGNAL_TRACKING_ENABLED),
+            ("Liquidity Analysis", LIQUIDITY_ANALYSIS_ENABLED),
+            ("Session Trading", SESSION_TRADING_ENABLED),
+            ("Correlation Sizing", CORRELATION_SIZING_ENABLED),
+        ]
+        
+        for name, enabled in features:
+            emoji = "✅" if enabled else "⚪"
+            msg += f"  {emoji} {name}\n"
+        
+        # === Memory & Trades ===
+        msg += "\n**📊 Current State:**\n"
+        msg += f"  Open Trades: {len(open_trades)}\n"
+        msg += f"  Protected: {len(protected_trades)}\n"
+        
+        # Stats
+        stats = load_stats()
+        msg += f"  Capital: ${stats.get('capital', SIMULATED_CAPITAL):,.2f}\n"
+        msg += f"  W/L: {stats.get('wins', 0)}/{stats.get('losses', 0)}\n"
+        
+        # === Session Info ===
+        try:
+            from bot.blofin_trader import get_current_session
+            session_name, session_mult = get_current_session()
+            msg += f"\n**🕐 Session:** {session_name} ({session_mult}x)\n"
+        except:
+            pass
+        
+        # === Version ===
+        msg += f"\n**📦 Version:** v{BOT_VERSION}\n"
+        msg += f"**⏰ Check Time:** {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
+        
+        await send_throttled(CHAT_ID, msg, parse_mode='Markdown')
+        
+    except Exception as e:
+        logging.error(f"System health error: {e}")
+        await send_throttled(CHAT_ID, f"Error: {str(e)}")
