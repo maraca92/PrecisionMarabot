@@ -330,6 +330,13 @@ except ImportError:
     async def backtest_pro_cmd(update, context):
         await update.message.reply_text("Professional backtest not available")
 
+# v27.12.17: Realistic backtest command
+try:
+    from bot.telegram_commands import backtest_real_cmd
+except ImportError:
+    async def backtest_real_cmd(update, context):
+        await update.message.reply_text("Realistic backtest not available")
+
 # Roadmap imports
 from bot.roadmap import (
     roadmap_zones, initialize_roadmaps, roadmap_generation_callback,
@@ -1833,12 +1840,12 @@ async def send_welcome_once():
             f"**AI:** Claude (Primary) + Grok (Opinion)\n"
             f"**Symbols:** {len(SYMBOLS)}\n"
             f"**Capital:** ${SIMULATED_CAPITAL:,.0f}\n\n"
-            f"**v27.12.16 Features:**\n"
-            f"{get_emoji('bullet')} Professional Backtest (/backtest_pro)\n"
-            f"{get_emoji('bullet')} Proper Leveraged PnL Calculation\n"
-            f"{get_emoji('bullet')} Monte Carlo Confidence Intervals\n"
-            f"{get_emoji('bullet')} Profit Factor & Sharpe Ratio\n"
-            f"{get_emoji('bullet')} Dynamic TPs & Orderbook Analysis\n\n"
+            f"**v27.12.17 Features:**\n"
+            f"{get_emoji('bullet')} Realistic Backtest (/backtest_real)\n"
+            f"{get_emoji('bullet')} Confirmation-based entries\n"
+            f"{get_emoji('bullet')} Fill probability modeling\n"
+            f"{get_emoji('bullet')} Volatility-scaled slippage\n"
+            f"{get_emoji('bullet')} Trade frequency limits\n\n"
             f"**Signal Evaluator:** {evaluator_status}\n"
             f"**Daily Recap:** {recap_status}\n"
             f"**Wick Detection:** {wick_status}\n"
@@ -2088,6 +2095,9 @@ def main():
     application.add_handler(CommandHandler("liquidity", liquidity_cmd))
     application.add_handler(CommandHandler("orderbook", orderbook_cmd))
     application.add_handler(CommandHandler("backtest_pro", backtest_pro_cmd))
+    
+    # v27.12.17: Realistic backtest command
+    application.add_handler(CommandHandler("backtest_real", backtest_real_cmd))
 
     application.add_handler(MessageHandler(filters.ALL, dummy_handler))
 
