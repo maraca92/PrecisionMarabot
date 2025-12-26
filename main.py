@@ -321,12 +321,14 @@ except ImportError:
 
 # v27.12.15: Liquidity and orderbook commands
 try:
-    from bot.telegram_commands import liquidity_cmd, orderbook_cmd
+    from bot.telegram_commands import liquidity_cmd, orderbook_cmd, backtest_pro_cmd
 except ImportError:
     async def liquidity_cmd(update, context):
         await update.message.reply_text("Liquidity command not available")
     async def orderbook_cmd(update, context):
         await update.message.reply_text("Orderbook command not available")
+    async def backtest_pro_cmd(update, context):
+        await update.message.reply_text("Professional backtest not available")
 
 # Roadmap imports
 from bot.roadmap import (
@@ -1831,12 +1833,12 @@ async def send_welcome_once():
             f"**AI:** Claude (Primary) + Grok (Opinion)\n"
             f"**Symbols:** {len(SYMBOLS)}\n"
             f"**Capital:** ${SIMULATED_CAPITAL:,.0f}\n\n"
-            f"**v27.12.15 Features:**\n"
-            f"{get_emoji('bullet')} Early Reversal Detection (RSI/MACD Div)\n"
-            f"{get_emoji('bullet')} Dynamic TPs (volatility-adjusted)\n"
-            f"{get_emoji('bullet')} Liquidity Map Analysis\n"
-            f"{get_emoji('bullet')} Orderbook Imbalance Detection\n"
-            f"{get_emoji('bullet')} Candlestick & Chart Patterns\n\n"
+            f"**v27.12.16 Features:**\n"
+            f"{get_emoji('bullet')} Professional Backtest (/backtest_pro)\n"
+            f"{get_emoji('bullet')} Proper Leveraged PnL Calculation\n"
+            f"{get_emoji('bullet')} Monte Carlo Confidence Intervals\n"
+            f"{get_emoji('bullet')} Profit Factor & Sharpe Ratio\n"
+            f"{get_emoji('bullet')} Dynamic TPs & Orderbook Analysis\n\n"
             f"**Signal Evaluator:** {evaluator_status}\n"
             f"**Daily Recap:** {recap_status}\n"
             f"**Wick Detection:** {wick_status}\n"
@@ -2085,6 +2087,7 @@ def main():
     # v27.12.15: Liquidity and orderbook commands
     application.add_handler(CommandHandler("liquidity", liquidity_cmd))
     application.add_handler(CommandHandler("orderbook", orderbook_cmd))
+    application.add_handler(CommandHandler("backtest_pro", backtest_pro_cmd))
 
     application.add_handler(MessageHandler(filters.ALL, dummy_handler))
 
